@@ -5,7 +5,7 @@
 #include <iostream>
 
 // ==========================================
-// 全局状态与常量
+// 全局变量
 // ==========================================
 HANDLE hProcess = NULL;
 uintptr_t moduleBase = 0;
@@ -15,7 +15,6 @@ uintptr_t gameDataManAddr = 0;
 uintptr_t worldChrManAddr = 0;
 uintptr_t funcAddresses[3] = { 0 }; 
 
-// Hook 状态结构体
 struct HookInfo {
     void* caveAddr;
     uintptr_t targetAddr;
@@ -44,7 +43,6 @@ const uintptr_t OFF_NO_GOODS = 0x551;
 // ==========================================
 // 内部工具函数
 // ==========================================
-
 DWORD GetProcId(const char* procName) {
     DWORD procId = 0;
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -137,6 +135,43 @@ void ScanFuncs(const std::vector<BYTE>& buffer) {
             }
         }
     }
+}
+
+// 关键修复：在目标地址附近申请内存 (解决 2GB 跳转崩溃问题)
+void* AllocNear(uintptr_t targetAddr, size_t size) {
+    SYSTEM_INFO sysInfo;
+    GetSystemInfo(&sysInfo);
+    uintptr_t pageSize = sysInfo.dwAllocationGranularity;
+
+    uintptr_t startAddr = (targetAddr & ~(pageSize - 1)); // 对齐
+    uintptr_t minAddr = (uintptr_t)sysInfo.lpMinimumApplicationAddress;
+    uintptr_t maxAddr = (uintptr_t)sysInfo.lpMaximumApplicationAddress;
+
+    // 向上搜寻 (1GB范围内)
+    for (size_t i = 0; i < 1024; i++) {
+        uintptr_t attemptAddr = startAddr + (i * pageSize);
+        if (attemptAddr >= maxAddr) break;
+        // 尝试申请
+        void* pMem = VirtualAllocEx(hProcess, (LPVOID)attemptAddr, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (pMem) {
+            // 检查距离是否在 2GB 内 (int32范围)
+            int64_t diff = (int64_t)pMem - (int64_t)targetAddr;
+            if (diff > -0x7FFFFFFF && diff < 0x7FFFFFFF) return pMem;
+            VirtualFreeEx(hProcess, pMem, 0, MEM_RELEASE);
+        }
+    }
+    // 向下搜寻
+    for (size_t i = 0; i < 1024; i++) {
+        uintptr_t attemptAddr = startAddr - (i * pageSize);
+        if (attemptAddr <= minAddr) break;
+        void* pMem = VirtualAllocEx(hProcess, (LPVOID)attemptAddr, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (pMem) {
+            int64_t diff = (int64_t)pMem - (int64_t)targetAddr;
+            if (diff > -0x7FFFFFFF && diff < 0x7FFFFFFF) return pMem;
+            VirtualFreeEx(hProcess, pMem, 0, MEM_RELEASE);
+        }
+    }
+    return nullptr;
 }
 
 // ==========================================
@@ -242,7 +277,6 @@ extern "C" {
             WriteProcessMemory(hProcess, (LPVOID)targetAddr, &val, 1, 0);
             return 1;
         }
-        
         if (type == 4) {
             targetAddr = GetPtrAddr(worldChrManAddr, {OFFSET_PLAYER, OFF_NO_GOODS});
             bitPos = 7;
@@ -252,7 +286,6 @@ extern "C" {
             else if (type == 2) bitPos = 5; 
             else if (type == 3) bitPos = 4; 
         }
-
         if (!targetAddr) return 0;
 
         BYTE current = 0;
@@ -260,7 +293,6 @@ extern "C" {
         BYTE newVal = current;
         if (enable) newVal |= (1 << bitPos);
         else newVal &= ~(1 << bitPos);
-
         if (newVal != current) WriteProcessMemory(hProcess, (LPVOID)targetAddr, &newVal, 1, 0);
         return 1;
     }
@@ -269,7 +301,6 @@ extern "C" {
         if (!hProcess || !gameDataManAddr) return 0;
         uintptr_t funcAddr = funcAddresses[target];
         if (funcAddr == 0) return -1; 
-
         uintptr_t gdmPtr = 0;
         ReadProcessMemory(hProcess, (LPCVOID)gameDataManAddr, &gdmPtr, 8, 0);
         if (!gdmPtr) return -2;
@@ -277,7 +308,8 @@ extern "C" {
         ReadProcessMemory(hProcess, (LPCVOID)(gdmPtr + 0x8), &playerDataPtr, 8, 0);
         if (!playerDataPtr) return -2;
 
-        void* shellcodeAddr = VirtualAllocEx(hProcess, NULL, 1024, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        void* shellcodeAddr = AllocNear(gdmPtr, 1024); // 尝试分配附近内存，虽然CreateRemoteThread不严格要求
+        if (!shellcodeAddr) shellcodeAddr = VirtualAllocEx(hProcess, NULL, 1024, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
         if (!shellcodeAddr) return 0;
 
         BYTE code[64];
@@ -297,7 +329,7 @@ extern "C" {
     }
 
     // ==========================================
-    // ⚔️ 修正版: 一击必杀 (Safe & Stable)
+    // ⚔️ 终极修正版: 一击必杀 (防崩溃)
     // ==========================================
     __declspec(dllexport) int SetOneHitKill(int enable) {
         if (!hProcess || !moduleSize || !worldChrManAddr) return 0;
@@ -305,56 +337,61 @@ extern "C" {
         if (enable) {
             if (ohkHook.active) return 1; 
 
+            // 1. 扫描目标: mov eax, [rax+140] (8B 80 40 01 00 00)
             std::vector<BYTE> buffer(moduleSize);
             ReadProcessMemory(hProcess, (LPCVOID)moduleBase, buffer.data(), moduleSize, 0);
-            // 使用更长的特征码 (8字节) 以确保唯一性
-            // 8B 80 40 01 00 00 48 83 (mov eax, [rax+140]; add rsp, ...)
             uintptr_t target = ScanPattern(buffer, "\x8B\x80\x40\x01\x00\x00\x48\x83", "xxxxxxxx");
             if (!target) return -1; 
 
             uintptr_t playerEntity = GetPtrAddr(worldChrManAddr, {OFFSET_PLAYER, 0x1B8, 0});
             if (!playerEntity) return -2; 
 
-            void* cave = VirtualAllocEx(hProcess, NULL, 1024, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-            if (!cave) return 0;
+            // ⚠️ 关键修复：申请内存必须在 Target 附近 (±2GB)，否则 JMP 会崩溃
+            void* cave = AllocNear(target, 1024);
+            if (!cave) return 0; // 申请失败
 
             BYTE code[128];
             int idx = 0;
 
-            // 1. Check Player (Safe Logic)
-            code[idx++] = 0x53; // push rbx
-            code[idx++] = 0x48; code[idx++] = 0xBB; *(uint64_t*)&code[idx] = playerEntity; idx += 8; // mov rbx, player
-            code[idx++] = 0x48; code[idx++] = 0x39; code[idx++] = 0xD8; // cmp rax, rbx
-            code[idx++] = 0x5B; // pop rbx
-            code[idx++] = 0x74; code[idx++] = 0x0A; // je +10 (Skip write)
+            // --- Shellcode ---
+            // push rbx
+            code[idx++] = 0x53; 
+            // mov rbx, playerEntity
+            code[idx++] = 0x48; code[idx++] = 0xBB; *(uint64_t*)&code[idx] = playerEntity; idx += 8;
+            // cmp rax, rbx
+            code[idx++] = 0x48; code[idx++] = 0x39; code[idx++] = 0xD8; 
+            // pop rbx
+            code[idx++] = 0x5B; 
+            // je +10 (如果是玩家，跳过写0操作)
+            code[idx++] = 0x74; code[idx++] = 0x0A; 
 
-            // 2. KILL (mov [rax+140], 0)
+            // mov [rax+140], 0 (写入 0 血量)
             code[idx++] = 0xC7; code[idx++] = 0x80;
             *(uint32_t*)&code[idx] = 0x140; idx += 4;
             *(uint32_t*)&code[idx] = 0; idx += 4;
 
-            // 3. RESTORE (mov eax, [rax+140]) - 关键！防止寄存器状态错误
+            // Original: mov eax, [rax+140] (还原被覆盖的指令)
             code[idx++] = 0x8B; code[idx++] = 0x80;
             *(uint32_t*)&code[idx] = 0x140; idx += 4;
 
-            // 4. JUMP BACK (Correct Calculation)
-            // JMP rel32 = E9 (Dest - NextIP)
-            code[idx++] = 0xE9; 
-            uintptr_t nextInstAddr = (uintptr_t)cave + idx + 4; // E9 + 4 bytes
-            uintptr_t backAddr = target + 6; 
-            int32_t jmpOffset = (int32_t)(backAddr - nextInstAddr);
-            *(int32_t*)&code[idx] = jmpOffset; idx += 4;
+            // ⚠️ 关键修复：使用绝对跳转跳回 (Absolute Jump)
+            // 防止跳回距离过远导致崩溃。格式: FF 25 00 00 00 00 [Address]
+            code[idx++] = 0xFF; code[idx++] = 0x25;
+            *(int32_t*)&code[idx] = 0; idx += 4; // RIP+0
+            uintptr_t backAddr = target + 6; // 跳回原指令下一条
+            *(uint64_t*)&code[idx] = backAddr; idx += 8;
 
             WriteProcessMemory(hProcess, cave, code, idx, 0);
 
-            // 5. Apply Hook
+            // --- Apply Hook ---
             BYTE patch[6];
-            patch[0] = 0xE9; 
-            // Target JMP Offset
-            int32_t hookOffset = (int32_t)((uintptr_t)cave - (target + 5));
-            *(int32_t*)&patch[1] = hookOffset;
+            patch[0] = 0xE9; // JMP
+            // 计算相对偏移 (现在 cave 一定在 2GB 内，所以是安全的)
+            int64_t diff = (int64_t)cave - (int64_t)target - 5;
+            *(int32_t*)&patch[1] = (int32_t)diff;
             patch[5] = 0x90; // NOP
 
+            // 备份并写入
             ReadProcessMemory(hProcess, (LPCVOID)target, ohkHook.originalBytes, 6, 0);
             WriteProcessMemory(hProcess, (LPVOID)target, patch, 6, 0);
 

@@ -18,5 +18,5 @@ jobs:
     - name: Upload DLL
       uses: actions/upload-artifact@v4
       with:
-        name: GameCore_DLL
-        path: build/Release/GameCore.dll
+        name: Nightreign_DLL
+        path: build/Release/NightreignGameCore.dll

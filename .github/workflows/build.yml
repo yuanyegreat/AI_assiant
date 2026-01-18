@@ -1,0 +1,22 @@
+name: Build DLL
+
+on: [push] # 每次提交代码就触发
+
+jobs:
+  build:
+    runs-on: windows-latest # 借用一台 Windows 电脑
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Configure CMake
+      run: cmake -B build -S .
+
+    - name: Build
+      run: cmake --build build --config Release
+
+    - name: Upload DLL
+      uses: actions/upload-artifact@v4
+      with:
+        name: GameCore_DLL
+        path: build/Release/GameCore.dll

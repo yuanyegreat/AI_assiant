@@ -16,7 +16,7 @@ uintptr_t worldChrManAddr = 0;
 uintptr_t funcAddresses[3] = { 0 };
 
 // GameDataMan 到 CSGaitem (物品库) 的偏移
-uintptr_t OFF_EQUIP_CONTAINER = 0;
+uintptr_t OFF_EQUIP_CONTAINER = 0; 
 
 // ⭐ 关键偏移量 (来自 Hexinton CT 表分析)
 // PlayerGameData = [GameDataMan] + 0x8
@@ -424,9 +424,9 @@ extern "C" {
     // ==========================================
 
     struct RelicInfo {
-        int slotIndex;
-        uint32_t attributes[3];
-        uint32_t debuffs[3];
+        int slotIndex;          
+        uint32_t attributes[3]; 
+        uint32_t debuffs[3];    
     };
 
     uintptr_t GetRelicPointer(int slot) {
@@ -458,7 +458,7 @@ extern "C" {
         uintptr_t itemPtrAddr = itemContainer + 0x8 + (equippedIndex * 8);
         uintptr_t finalRelicAddr = 0;
         ReadProcessMemory(hProcess, (LPCVOID)itemPtrAddr, &finalRelicAddr, sizeof(finalRelicAddr), NULL);
-
+        
         return finalRelicAddr;
     }
 
@@ -468,7 +468,7 @@ extern "C" {
         for (int i = 0; i < 6; i++) {
             outArray[i].slotIndex = i;
             uintptr_t addr = GetRelicPointer(i);
-
+            
             if (addr != 0) {
                 ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x18), &outArray[i].attributes[0], sizeof(uint32_t), NULL);
                 ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x1C), &outArray[i].attributes[1], sizeof(uint32_t), NULL);

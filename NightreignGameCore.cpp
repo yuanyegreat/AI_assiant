@@ -15,11 +15,14 @@ uintptr_t gameDataManAddr = 0;
 uintptr_t worldChrManAddr = 0;
 uintptr_t funcAddresses[3] = { 0 };
 
-// 动态计算的偏移量
+// GameDataMan 到 CSGaitem (物品库) 的偏移
 uintptr_t OFF_EQUIP_CONTAINER = 0;
 
-// 默认为 -1，必须通过校准找到
-int RELIC_BASE_INDEX = -1;
+// ⭐ 关键偏移量 (来自 Hexinton CT 表分析)
+// PlayerGameData = [GameDataMan] + 0x8
+// EquippedRelicIndex = PlayerGameData + 0x2F4 (每个槽位间隔 4 字节)
+const uintptr_t OFF_PLAYER_GAME_DATA = 0x8;
+const uintptr_t OFF_RELIC_INDICES_START = 0x2F4;
 
 struct HookInfo {
     void* caveAddr;
@@ -176,40 +179,6 @@ void* AllocNear(uintptr_t targetAddr, size_t size) {
 }
 
 // ==========================================
-// ⭐ 核心新功能: 按数值反向扫描 (Calibration)
-// ==========================================
-// 这就是你要的功能：传入 7034600，我来告诉你 Index 是多少
-extern "C" __declspec(dllexport) bool ScanRelicByValue(uint32_t targetValue) {
-    if (hProcess == NULL || gameDataManAddr == 0 || OFF_EQUIP_CONTAINER == 0) return false;
-
-    uintptr_t containerPtr = 0;
-    ReadProcessMemory(hProcess, (LPCVOID)(gameDataManAddr + OFF_EQUIP_CONTAINER), &containerPtr, sizeof(containerPtr), NULL);
-    if (containerPtr == 0) return false;
-
-    // 遍历整个装备背包 (0 - 1000)
-    for (int i = 0; i < 1000; i++) {
-        // 计算第 i 个物品的地址
-        uintptr_t itemPtrAddr = containerPtr + 0x8 + (i * 8);
-        uintptr_t relicAddr = 0;
-
-        if (ReadProcessMemory(hProcess, (LPCVOID)itemPtrAddr, &relicAddr, sizeof(relicAddr), NULL) && relicAddr != 0) {
-            uint32_t attr1 = 0;
-            // 读取 Attribute 1
-            if (ReadProcessMemory(hProcess, (LPCVOID)(relicAddr + 0x18), &attr1, sizeof(attr1), NULL)) {
-
-                // ⭐ 如果找到了用户输入的数值，立刻锁定这个位置！
-                if (attr1 == targetValue) {
-                    RELIC_BASE_INDEX = i;
-                    // printf("Calibrated! Found value %d at Index %d\n", targetValue, i);
-                    return true;
-                }
-            }
-        }
-    }
-    return false; // 没找到
-}
-
-// ==========================================
 // 🚀 导出接口
 // ==========================================
 extern "C" {
@@ -242,7 +211,7 @@ extern "C" {
             worldChrManAddr = addrWCM + 7 + offset;
         }
 
-        // 3. CSGaitem -> OFF_EQUIP_CONTAINER
+        // 3. CSGaitem -> OFF_EQUIP_CONTAINER (物品库基址)
         const char* patternGaItem = "\x48\x8D\x44\x24\x40\x48\x89\x44\x24\x50\x8B\x02\x89\x44\x24\x40\x48\x8B\x0D\x00\x00\x00\x00\x48\x85\xC9";
         const char* maskGaItem    = "xxxxxxxxxxxxxxxxxxx????xxx";
         uintptr_t foundGaItem = ScanPattern(buffer, patternGaItem, maskGaItem);
@@ -256,7 +225,7 @@ extern "C" {
 
         ScanFuncs(buffer);
 
-        // 注意：这里不再自动调用 AutoDetect，等待用户手动校准
+        // 成功条件：只要基址都找到了就行，不再需要自动探测Index
         return (gameDataManAddr && worldChrManAddr && OFF_EQUIP_CONTAINER != 0) ? 1 : 0;
     }
 
@@ -451,7 +420,7 @@ extern "C" {
     }
 
     // ==========================================
-    // ⭐ 遗物 (Relic) 相关导出
+    // ⭐ 遗物 (Relic) 相关导出 [完美复刻版]
     // ==========================================
 
     struct RelicInfo {
@@ -464,29 +433,42 @@ extern "C" {
         if (hProcess == NULL || gameDataManAddr == 0) return 0;
         if (OFF_EQUIP_CONTAINER == 0) return 0;
 
-        // 🚨 安全检查
-        if (RELIC_BASE_INDEX == -1) return 0;
+        // 1. 获取物品库基址 (CSGaitem)
+        uintptr_t itemContainer = 0;
+        ReadProcessMemory(hProcess, (LPCVOID)(gameDataManAddr + OFF_EQUIP_CONTAINER), &itemContainer, sizeof(itemContainer), NULL);
+        if (itemContainer == 0) return 0;
 
-        uintptr_t containerPtr = 0;
-        if (!ReadProcessMemory(hProcess, (LPCVOID)(gameDataManAddr + OFF_EQUIP_CONTAINER), &containerPtr, sizeof(containerPtr), NULL)) return 0;
-        if (containerPtr == 0) return 0;
+        // 2. 获取玩家数据基址 (PlayerGameData)
+        uintptr_t playerData = 0;
+        ReadProcessMemory(hProcess, (LPCVOID)(gameDataManAddr + OFF_PLAYER_GAME_DATA), &playerData, sizeof(playerData), NULL);
+        if (playerData == 0) return 0;
 
-        // 使用校准后的索引
-        int targetIndex = RELIC_BASE_INDEX + (slot * 4);
+        // 3. ⭐ 读取当前槽位的【真实索引】
+        // 逻辑来自 Hexinton Lua: writeSmallInteger("Gaitem+0", readSmallInteger("[[gamedataman]+8]+2F4"))
+        // Slot 0 -> +2F4, Slot 1 -> +2F8 ... ( stride = 4 )
+        uintptr_t indexAddr = playerData + OFF_RELIC_INDICES_START + (slot * 4);
+        int32_t equippedIndex = -1;
+        ReadProcessMemory(hProcess, (LPCVOID)indexAddr, &equippedIndex, sizeof(int32_t), NULL);
 
-        uintptr_t itemPtrAddr = containerPtr + 0x8 + (targetIndex * 8);
+        // 如果索引无效 (<0)，说明该槽位没装备东西
+        if (equippedIndex < 0) return 0;
+
+        // 4. ⭐ 根据索引计算遗物内存地址
+        // 地址 = 容器 + 8 + (Index * 8)
+        uintptr_t itemPtrAddr = itemContainer + 0x8 + (equippedIndex * 8);
         uintptr_t finalRelicAddr = 0;
         ReadProcessMemory(hProcess, (LPCVOID)itemPtrAddr, &finalRelicAddr, sizeof(finalRelicAddr), NULL);
+
         return finalRelicAddr;
     }
 
     __declspec(dllexport) bool GetAllRelics(RelicInfo* outArray, int size) {
         if (hProcess == NULL || size < 6) return false;
-        if (RELIC_BASE_INDEX == -1) return false;
 
         for (int i = 0; i < 6; i++) {
             outArray[i].slotIndex = i;
             uintptr_t addr = GetRelicPointer(i);
+
             if (addr != 0) {
                 ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x18), &outArray[i].attributes[0], sizeof(uint32_t), NULL);
                 ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x1C), &outArray[i].attributes[1], sizeof(uint32_t), NULL);
@@ -512,7 +494,6 @@ extern "C" {
         return WriteProcessMemory(hProcess, (LPVOID)targetAddr, &newValue, sizeof(newValue), NULL);
     }
 
-    __declspec(dllexport) void DebugSetRelicIndex(int newIndex) {
-        RELIC_BASE_INDEX = newIndex;
-    }
+    // 保留接口防报错，但不再需要使用
+    __declspec(dllexport) void DebugSetRelicIndex(int newIndex) {}
 }

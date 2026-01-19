@@ -13,16 +13,8 @@ size_t moduleSize = 0;
 
 uintptr_t gameDataManAddr = 0;
 uintptr_t worldChrManAddr = 0;
+uintptr_t csGaitemAddr = 0;
 uintptr_t funcAddresses[3] = { 0 };
-
-// GameDataMan 到 CSGaitem (物品库) 的偏移
-uintptr_t OFF_EQUIP_CONTAINER = 0; 
-
-// ⭐ 关键偏移量 (来自 Hexinton CT 表分析)
-// PlayerGameData = [GameDataMan] + 0x8
-// EquippedRelicIndex = PlayerGameData + 0x2F4 (每个槽位间隔 4 字节)
-const uintptr_t OFF_PLAYER_GAME_DATA = 0x8;
-const uintptr_t OFF_RELIC_INDICES_START = 0x2F4;
 
 struct HookInfo {
     void* caveAddr;
@@ -146,25 +138,30 @@ void ScanFuncs(const std::vector<BYTE>& buffer) {
     }
 }
 
-// 关键修复：在目标地址附近申请内存
+// 关键修复：在目标地址附近申请内存 (解决 2GB 跳转崩溃问题)
 void* AllocNear(uintptr_t targetAddr, size_t size) {
     SYSTEM_INFO sysInfo;
     GetSystemInfo(&sysInfo);
     uintptr_t pageSize = sysInfo.dwAllocationGranularity;
-    uintptr_t startAddr = (targetAddr & ~(pageSize - 1));
+
+    uintptr_t startAddr = (targetAddr & ~(pageSize - 1)); // 对齐
     uintptr_t minAddr = (uintptr_t)sysInfo.lpMinimumApplicationAddress;
     uintptr_t maxAddr = (uintptr_t)sysInfo.lpMaximumApplicationAddress;
 
+    // 向上搜寻 (1GB范围内)
     for (size_t i = 0; i < 1024; i++) {
         uintptr_t attemptAddr = startAddr + (i * pageSize);
         if (attemptAddr >= maxAddr) break;
+        // 尝试申请
         void* pMem = VirtualAllocEx(hProcess, (LPVOID)attemptAddr, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         if (pMem) {
+            // 检查距离是否在 2GB 内 (int32范围)
             int64_t diff = (int64_t)pMem - (int64_t)targetAddr;
             if (diff > -0x7FFFFFFF && diff < 0x7FFFFFFF) return pMem;
             VirtualFreeEx(hProcess, pMem, 0, MEM_RELEASE);
         }
     }
+    // 向下搜寻
     for (size_t i = 0; i < 1024; i++) {
         uintptr_t attemptAddr = startAddr - (i * pageSize);
         if (attemptAddr <= minAddr) break;
@@ -195,7 +192,6 @@ extern "C" {
         std::vector<BYTE> buffer(moduleSize);
         if (!ReadProcessMemory(hProcess, (LPCVOID)moduleBase, buffer.data(), moduleSize, 0)) return 0;
 
-        // 1. GameDataMan
         uintptr_t addrGDM = ScanPattern(buffer, "\x48\x8B\x0D\x00\x00\x00\x00\xF3\x48\x0F\x2C\xC0", "xxx????xxxxx");
         if (addrGDM) {
             int32_t offset = 0;
@@ -203,7 +199,6 @@ extern "C" {
             gameDataManAddr = addrGDM + 7 + offset;
         }
 
-        // 2. WorldChrMan
         uintptr_t addrWCM = ScanPattern(buffer, "\x48\x8B\x05\x00\x00\x00\x00\x0F\x28\xF1\x48\x85\xC0", "xxx????xxxxxx");
         if (addrWCM) {
             int32_t offset = 0;
@@ -211,22 +206,8 @@ extern "C" {
             worldChrManAddr = addrWCM + 7 + offset;
         }
 
-        // 3. CSGaitem -> OFF_EQUIP_CONTAINER (物品库基址)
-        const char* patternGaItem = "\x48\x8D\x44\x24\x40\x48\x89\x44\x24\x50\x8B\x02\x89\x44\x24\x40\x48\x8B\x0D\x00\x00\x00\x00\x48\x85\xC9";
-        const char* maskGaItem    = "xxxxxxxxxxxxxxxxxxx????xxx";
-        uintptr_t foundGaItem = ScanPattern(buffer, patternGaItem, maskGaItem);
-        if (foundGaItem && gameDataManAddr) {
-            uintptr_t instructionAddr = foundGaItem + 0x10;
-            int32_t offset = 0;
-            ReadProcessMemory(hProcess, (LPCVOID)(instructionAddr + 3), &offset, 4, 0);
-            uintptr_t csGaItemAddr = instructionAddr + 7 + offset;
-            OFF_EQUIP_CONTAINER = csGaItemAddr - gameDataManAddr;
-        }
-
         ScanFuncs(buffer);
-
-        // 成功条件：只要基址都找到了就行，不再需要自动探测Index
-        return (gameDataManAddr && worldChrManAddr && OFF_EQUIP_CONTAINER != 0) ? 1 : 0;
+        return (gameDataManAddr && worldChrManAddr) ? 1 : 0;
     }
 
     __declspec(dllexport) int ManageStat(int type, int mode, int value) {
@@ -328,7 +309,7 @@ extern "C" {
         ReadProcessMemory(hProcess, (LPCVOID)(gdmPtr + 0x8), &playerDataPtr, 8, 0);
         if (!playerDataPtr) return -2;
 
-        void* shellcodeAddr = AllocNear(gdmPtr, 1024); // 尝试分配附近内存
+        void* shellcodeAddr = AllocNear(gdmPtr, 1024); // 尝试分配附近内存，虽然CreateRemoteThread不严格要求
         if (!shellcodeAddr) shellcodeAddr = VirtualAllocEx(hProcess, NULL, 1024, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
         if (!shellcodeAddr) return 0;
 
@@ -348,13 +329,16 @@ extern "C" {
         return 1;
     }
 
+    // ==========================================
+    // ⚔️ 终极修正版: 一击必杀 (防崩溃)
+    // ==========================================
     __declspec(dllexport) int SetOneHitKill(int enable) {
         if (!hProcess || !moduleSize || !worldChrManAddr) return 0;
 
         if (enable) {
             if (ohkHook.active) return 1;
 
-            // 1. 扫描目标
+            // 1. 扫描目标: mov eax, [rax+140] (8B 80 40 01 00 00)
             std::vector<BYTE> buffer(moduleSize);
             ReadProcessMemory(hProcess, (LPCVOID)moduleBase, buffer.data(), moduleSize, 0);
             uintptr_t target = ScanPattern(buffer, "\x8B\x80\x40\x01\x00\x00\x48\x83", "xxxxxxxx");
@@ -371,11 +355,16 @@ extern "C" {
             int idx = 0;
 
             // --- Shellcode ---
-            code[idx++] = 0x53; // push rbx
-            code[idx++] = 0x48; code[idx++] = 0xBB; *(uint64_t*)&code[idx] = playerEntity; idx += 8; // mov rbx, playerEntity
-            code[idx++] = 0x48; code[idx++] = 0x39; code[idx++] = 0xD8; // cmp rax, rbx
-            code[idx++] = 0x5B; // pop rbx
-            code[idx++] = 0x74; code[idx++] = 0x0A; // je +10
+            // push rbx
+            code[idx++] = 0x53;
+            // mov rbx, playerEntity
+            code[idx++] = 0x48; code[idx++] = 0xBB; *(uint64_t*)&code[idx] = playerEntity; idx += 8;
+            // cmp rax, rbx
+            code[idx++] = 0x48; code[idx++] = 0x39; code[idx++] = 0xD8;
+            // pop rbx
+            code[idx++] = 0x5B;
+            // je +10 (如果是玩家，跳过写0操作)
+            code[idx++] = 0x74; code[idx++] = 0x0A;
 
             // mov [rax+140], 0 (写入 0 血量)
             code[idx++] = 0xC7; code[idx++] = 0x80;
@@ -387,6 +376,7 @@ extern "C" {
             *(uint32_t*)&code[idx] = 0x140; idx += 4;
 
             // ⚠️ 关键修复：使用绝对跳转跳回 (Absolute Jump)
+            // 防止跳回距离过远导致崩溃。格式: FF 25 00 00 00 00 [Address]
             code[idx++] = 0xFF; code[idx++] = 0x25;
             *(int32_t*)&code[idx] = 0; idx += 4; // RIP+0
             uintptr_t backAddr = target + 6; // 跳回原指令下一条
@@ -397,6 +387,7 @@ extern "C" {
             // --- Apply Hook ---
             BYTE patch[6];
             patch[0] = 0xE9; // JMP
+            // 计算相对偏移 (现在 cave 一定在 2GB 内，所以是安全的)
             int64_t diff = (int64_t)cave - (int64_t)target - 5;
             *(int32_t*)&patch[1] = (int32_t)diff;
             patch[5] = 0x90; // NOP
@@ -418,82 +409,69 @@ extern "C" {
             return 1;
         }
     }
+}
 
-    // ==========================================
-    // ⭐ 遗物 (Relic) 相关导出 [完美复刻版]
-    // ==========================================
+void InitCSGaitemAddress() {
+    // 特征码：48 8D 44 24 40 48 89 44 24 50 8B 02 89 44 24 40 48 8B 0D
+    // 注意：Hexinton 脚本里这里有一个 offset = 0x10 的处理，说明真正的 mov rcx, [rip+offset] 在特征码开始后的第16个字节
+    // 原始特征码较长，我们取关键部分进行搜索，或者直接使用脚本里的完整码
+    // 对应 Lua: {name = "CSGaitem", aob = "48 8D ... 48 8B 0D ?? ?? ?? ?? 48 85 C9", offset = 0x10}
 
-    struct RelicInfo {
-        int slotIndex;          
-        uint32_t attributes[3]; 
-        uint32_t debuffs[3];    
-    };
+    // 假设你有一个 AOBScan 函数，这里是伪代码逻辑，请替换为你实际的扫描函数
+    // 这里的 pattern 对应 offset 0x10 处的那条指令: 48 8B 0D ...
+    std::string pattern = "48 8B 0D ?? ?? ?? ?? 48 85 C9";
+    uintptr_t aobResult = AOBScanModuleUnique("nightreign.exe", pattern);
 
-    uintptr_t GetRelicPointer(int slot) {
-        if (hProcess == NULL || gameDataManAddr == 0) return 0;
-        if (OFF_EQUIP_CONTAINER == 0) return 0;
-
-        // 1. 获取物品库基址 (CSGaitem)
-        uintptr_t itemContainer = 0;
-        ReadProcessMemory(hProcess, (LPCVOID)(gameDataManAddr + OFF_EQUIP_CONTAINER), &itemContainer, sizeof(itemContainer), NULL);
-        if (itemContainer == 0) return 0;
-
-        // 2. 获取玩家数据基址 (PlayerGameData)
-        uintptr_t playerData = 0;
-        ReadProcessMemory(hProcess, (LPCVOID)(gameDataManAddr + OFF_PLAYER_GAME_DATA), &playerData, sizeof(playerData), NULL);
-        if (playerData == 0) return 0;
-
-        // 3. ⭐ 读取当前槽位的【真实索引】
-        // 逻辑来自 Hexinton Lua: writeSmallInteger("Gaitem+0", readSmallInteger("[[gamedataman]+8]+2F4"))
-        // Slot 0 -> +2F4, Slot 1 -> +2F8 ... ( stride = 4 )
-        uintptr_t indexAddr = playerData + OFF_RELIC_INDICES_START + (slot * 4);
-        int32_t equippedIndex = -1;
-        ReadProcessMemory(hProcess, (LPCVOID)indexAddr, &equippedIndex, sizeof(int32_t), NULL);
-
-        // 如果索引无效 (<0)，说明该槽位没装备东西
-        if (equippedIndex < 0) return 0;
-
-        // 4. ⭐ 根据索引计算遗物内存地址
-        // 地址 = 容器 + 8 + (Index * 8)
-        uintptr_t itemPtrAddr = itemContainer + 0x8 + (equippedIndex * 8);
-        uintptr_t finalRelicAddr = 0;
-        ReadProcessMemory(hProcess, (LPCVOID)itemPtrAddr, &finalRelicAddr, sizeof(finalRelicAddr), NULL);
-        
-        return finalRelicAddr;
+    if (aobResult != 0) {
+        // 解析 RIP 寻址 ( 48 8B 0D [Offset] )
+        // 指令长度 7 字节
+        int32_t ripOffset = 0;
+        ReadProcessMemory(hProcess, (LPCVOID)(aobResult + 3), &ripOffset, sizeof(ripOffset), 0);
+        csGaitemAddr = aobResult + 7 + ripOffset;
+        std::cout << "CSGaitem Address: " << std::hex << csGaitemAddr << std::endl;
+    } else {
+        std::cerr << "Failed to find CSGaitem" << std::endl;
     }
+}
 
-    __declspec(dllexport) bool GetAllRelics(RelicInfo* outArray, int size) {
-        if (hProcess == NULL || size < 6) return false;
+// 3. 获取第一个遗物 (1st Equipped Relic) 的 Attribute 1 ID 的方法
+int GetFirstRelicAttribute1() {
+    if (gameDataManAddr == 0 || csGaitemAddr == 0) return -1;
 
-        for (int i = 0; i < 6; i++) {
-            outArray[i].slotIndex = i;
-            uintptr_t addr = GetRelicPointer(i);
-            
-            if (addr != 0) {
-                ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x18), &outArray[i].attributes[0], sizeof(uint32_t), NULL);
-                ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x1C), &outArray[i].attributes[1], sizeof(uint32_t), NULL);
-                ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x20), &outArray[i].attributes[2], sizeof(uint32_t), NULL);
-                ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x40), &outArray[i].debuffs[0], sizeof(uint32_t), NULL);
-                ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x44), &outArray[i].debuffs[1], sizeof(uint32_t), NULL);
-                ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x48), &outArray[i].debuffs[2], sizeof(uint32_t), NULL);
-            } else {
-                memset(outArray[i].attributes, 0, sizeof(outArray[i].attributes));
-                memset(outArray[i].debuffs, 0, sizeof(outArray[i].debuffs));
-            }
-        }
-        return true;
-    }
+    // 步骤 1: 获取 PlayerGameData 指针
+    uintptr_t playerGameData = 0;
+    // [GameDataMan] + 0x8
+    uintptr_t ptrToPlayerGameData = 0;
+    ReadProcessMemory(hProcess, (LPCVOID)gameDataManAddr, &ptrToPlayerGameData, sizeof(ptrToPlayerGameData), 0);
+    ReadProcessMemory(hProcess, (LPCVOID)(ptrToPlayerGameData + 0x8), &playerGameData, sizeof(playerGameData), 0);
 
-    __declspec(dllexport) bool SetRelicAttribute(int relicSlot, int type, int index, uint32_t newValue) {
-        if (index < 0 || index > 2) return false;
-        uintptr_t addr = GetRelicPointer(relicSlot);
-        if (addr == 0) return false;
-        uintptr_t targetAddr = 0;
-        if (type == 0) targetAddr = addr + 0x18 + (index * 4);
-        else targetAddr = addr + 0x40 + (index * 4);
-        return WriteProcessMemory(hProcess, (LPVOID)targetAddr, &newValue, sizeof(newValue), NULL);
-    }
+    if (playerGameData == 0) return -1;
 
-    // 保留接口防报错，但不再需要使用
-    __declspec(dllexport) void DebugSetRelicIndex(int newIndex) {}
+    // 步骤 2: 获取第一个遗物的索引 (Index)
+    // 偏移 0x2F4 对应 "1st Equipped Relic" 的索引
+    int16_t relicIndex = 0;
+    ReadProcessMemory(hProcess, (LPCVOID)(playerGameData + 0x2F4), &relicIndex, sizeof(relicIndex), 0);
+
+    // 步骤 3: 从 CSGaitem 获取具体的遗物对象指针
+    // Lua 逻辑: 8 + 8 * [GaitemIndex]
+    // CSGaitem 本身存放了一个指针，或者直接作为基址使用，根据 Lua "readQword(CSGaitem)" 来判断
+    // 通常 registerSymbol 后，直接读取符号地址的值。
+    uintptr_t csGaitemBase = 0;
+    ReadProcessMemory(hProcess, (LPCVOID)csGaitemAddr, &csGaitemBase, sizeof(csGaitemBase), 0);
+
+    if (csGaitemBase == 0) return -1;
+
+    // 计算目标指针在数组中的位置
+    uintptr_t targetRelicPtrLoc = csGaitemBase + 0x8 + (relicIndex * 0x8);
+    uintptr_t targetRelicAddr = 0;
+    ReadProcessMemory(hProcess, (LPCVOID)targetRelicPtrLoc, &targetRelicAddr, sizeof(targetRelicAddr), 0);
+
+    if (targetRelicAddr == 0) return -1;
+
+    // 步骤 4: 读取 Attribute 1 ID
+    // 偏移 +0x18
+    int32_t attribute1ID = 0;
+    ReadProcessMemory(hProcess, (LPCVOID)(targetRelicAddr + 0x18), &attribute1ID, sizeof(attribute1ID), 0);
+
+    return attribute1ID;
 }

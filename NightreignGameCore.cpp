@@ -189,33 +189,33 @@ void* AllocNear(uintptr_t targetAddr, size_t size) {
 void AutoDetectRelicIndex() {
     if (hProcess == NULL || gameDataManAddr == 0 || OFF_EQUIP_CONTAINER == 0) return;
 
-    // 获取容器基址
     uintptr_t containerPtr = 0;
     ReadProcessMemory(hProcess, (LPCVOID)(gameDataManAddr + OFF_EQUIP_CONTAINER), &containerPtr, sizeof(containerPtr), NULL);
     if (containerPtr == 0) return;
 
-    // 遍历索引 0 到 300
-    // 原理：找到第一个“属性ID”看起来像有效遗物ID（600w-800w）的索引
-    for (int i = 0; i < 300; i++) {
-        // 计算第 i 个遗物的地址: Container + 8 + (Index * 8)
+    int bestIndex = -1;
+
+    // 遍历范围扩大到 500，确保覆盖 120 及其后的位置
+    for (int i = 0; i < 500; i++) {
         uintptr_t itemPtrAddr = containerPtr + 0x8 + (i * 8);
         uintptr_t relicAddr = 0;
 
         if (ReadProcessMemory(hProcess, (LPCVOID)itemPtrAddr, &relicAddr, sizeof(relicAddr), NULL) && relicAddr != 0) {
             uint32_t attr1 = 0;
-            // 读取 Attribute 1 (偏移 0x18)
             if (ReadProcessMemory(hProcess, (LPCVOID)(relicAddr + 0x18), &attr1, sizeof(attr1), NULL)) {
-                // 判断是否是有效的遗物 ID (通常是 6xxxxxx 或 7xxxxxx)
+                // 有效性检查：ID 必须在 600w - 800w 之间
                 if (attr1 > 6000000 && attr1 < 8000000) {
-                    RELIC_BASE_INDEX = i;
-                    // 可选：打印调试信息
-                    // printf("Auto-detected Relic Index: %d (ID: %d)\n", i, attr1);
-                    return; // 找到即止
+                    // ⚠️ 关键修改：不要 return，而是记录下来，继续往后找
+                    bestIndex = i;
                 }
             }
         }
     }
-    // 如果全循环完都没找到，RELIC_BASE_INDEX 保持为 -1
+
+    // 如果找到了，就使用最大的那个索引
+    if (bestIndex != -1) {
+        RELIC_BASE_INDEX = bestIndex;
+    }
 }
 
 

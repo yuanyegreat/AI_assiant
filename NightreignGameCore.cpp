@@ -19,7 +19,7 @@ uintptr_t funcAddresses[3] = { 0 };
 uintptr_t OFF_EQUIP_CONTAINER = 0;
 
 // 遗物起始索引 (根据之前的扫描结果，默认为 29，支持动态调整)
-int RELIC_BASE_INDEX = 29;
+int RELIC_BASE_INDEX = 120;
 
 struct HookInfo {
     void* caveAddr;

@@ -15,6 +15,12 @@ uintptr_t gameDataManAddr = 0;
 uintptr_t worldChrManAddr = 0;
 uintptr_t funcAddresses[3] = { 0 };
 
+// ⚠️ 修改：不再使用硬编码，而是作为变量由 ScanAll 自动计算
+uintptr_t OFF_EQUIP_CONTAINER = 0;
+
+// 遗物起始索引 (根据之前的扫描结果，默认为 29，支持动态调整)
+int RELIC_BASE_INDEX = 29;
+
 struct HookInfo {
     void* caveAddr;
     uintptr_t targetAddr;
@@ -191,6 +197,7 @@ extern "C" {
         std::vector<BYTE> buffer(moduleSize);
         if (!ReadProcessMemory(hProcess, (LPCVOID)moduleBase, buffer.data(), moduleSize, 0)) return 0;
 
+        // 1. 扫描 GameDataMan
         uintptr_t addrGDM = ScanPattern(buffer, "\x48\x8B\x0D\x00\x00\x00\x00\xF3\x48\x0F\x2C\xC0", "xxx????xxxxx");
         if (addrGDM) {
             int32_t offset = 0;
@@ -198,6 +205,7 @@ extern "C" {
             gameDataManAddr = addrGDM + 7 + offset;
         }
 
+        // 2. 扫描 WorldChrMan
         uintptr_t addrWCM = ScanPattern(buffer, "\x48\x8B\x05\x00\x00\x00\x00\x0F\x28\xF1\x48\x85\xC0", "xxx????xxxxxx");
         if (addrWCM) {
             int32_t offset = 0;
@@ -205,8 +213,29 @@ extern "C" {
             worldChrManAddr = addrWCM + 7 + offset;
         }
 
+        // --- ⭐ 新增: 扫描 CSGaitem 并计算 OFF_EQUIP_CONTAINER ---
+        // 特征码对应: 48 8B 0D [偏移] (位于特征码序列偏移 0x10 处)
+        const char* patternGaItem = "\x48\x8D\x44\x24\x40\x48\x89\x44\x24\x50\x8B\x02\x89\x44\x24\x40\x48\x8B\x0D\x00\x00\x00\x00\x48\x85\xC9";
+        const char* maskGaItem    = "xxxxxxxxxxxxxxxxxxx????xxx";
+
+        uintptr_t foundGaItem = ScanPattern(buffer, patternGaItem, maskGaItem);
+        if (foundGaItem && gameDataManAddr) {
+            // 找到指令位置 (Mov RCX, [RIP+...])
+            uintptr_t instructionAddr = foundGaItem + 0x10;
+
+            int32_t offset = 0;
+            ReadProcessMemory(hProcess, (LPCVOID)(instructionAddr + 3), &offset, 4, 0);
+
+            // 计算绝对地址 = 当前指令地址 + 指令长度7 + 偏移
+            uintptr_t csGaItemAddr = instructionAddr + 7 + offset;
+
+            // ⭐ 自动计算偏移: CSGaitem - GameDataMan
+            OFF_EQUIP_CONTAINER = csGaItemAddr - gameDataManAddr;
+        }
+
         ScanFuncs(buffer);
-        return (gameDataManAddr && worldChrManAddr) ? 1 : 0;
+        // 成功条件：核心基址和偏移量必须有效
+        return (gameDataManAddr && worldChrManAddr && OFF_EQUIP_CONTAINER != 0) ? 1 : 0;
     }
 
     __declspec(dllexport) int ManageStat(int type, int mode, int value) {
@@ -408,82 +437,97 @@ extern "C" {
             return 1;
         }
     }
-}
 
+    // ==========================================
+    // ⭐ 新增: 遗物 (Relic) 相关导出
+    // ==========================================
 
-// 1. 定义导出给 Python 的结构体
-// 必须与 Python 的 ctypes 结构完全对应
-struct RelicInfo {
-    int slotIndex;          // 0-5
-    uint32_t attributes[3]; // 正面属性 ID
-    uint32_t debuffs[3];    // 负面属性 ID (通常用于深渊遗物)
-};
+    // 导出给 Python 的结构体
+    struct RelicInfo {
+        int slotIndex;          // 0-5
+        uint32_t attributes[3]; // 正面属性 ID
+        uint32_t debuffs[3];    // 负面属性 ID (通常用于深渊遗物)
+    };
 
-// 2. 关键配置 (根据 CT 表推算的默认值)
-// GameDataMan + 0xA8 通常是 EquipData (csgaitem 所在的容器)
-uintptr_t OFF_EQUIP_CONTAINER = 0xA8;
+    // 内部辅助：获取第 N 个遗物的指针地址
+    uintptr_t GetRelicPointer(int slot) {
+        if (hProcess == NULL || gameDataManAddr == 0) return 0;
+        if (OFF_EQUIP_CONTAINER == 0) return 0; // 如果 ScanAll 没计算出来，直接返回
 
-// 对应 CT 表中的 [Gaitem] 基础索引值
-// 这个值决定了从数组的第几个位置开始算作“遗物槽位1”
-// 如果读出来是 0，我们可能需要调整这个值
-int RELIC_BASE_INDEX = 12;
-
-// 3. 内部辅助：获取第 N 个遗物的指针地址
-uintptr_t GetRelicPointer(int slot) {
-    if (hProcess == NULL || gameDataManAddr == 0) return 0;
-
-    // 第一步：读取装备容器指针 (csgaitem 的上一级)
-    uintptr_t containerPtr = 0;
-    if (!ReadProcessMemory(hProcess, (LPCVOID)(gameDataManAddr + OFF_EQUIP_CONTAINER), &containerPtr, sizeof(containerPtr), NULL)) {
-        return 0;
-    }
-    if (containerPtr == 0) return 0;
-
-    // 第二步：计算数组索引
-    // 逻辑复刻 CT 表: 8 + 8 * (Base + Slot * 4)
-    // 每个遗物间隔 4 个指针位置
-    int targetIndex = RELIC_BASE_INDEX + (slot * 4);
-
-    // 第三步：读取具体的遗物指针
-    // 指针数组起始偏移通常是 0x8 或 0x10，CT 表里写的是 8
-    uintptr_t itemPtrAddr = containerPtr + 0x8 + (targetIndex * 8);
-
-    uintptr_t finalRelicAddr = 0;
-    ReadProcessMemory(hProcess, (LPCVOID)itemPtrAddr, &finalRelicAddr, sizeof(finalRelicAddr), NULL);
-
-    return finalRelicAddr;
-}
-
-// 4. 导出函数：读取所有遗物数据
-extern "C" __declspec(dllexport) bool GetAllRelics(RelicInfo* outArray, int size) {
-    if (hProcess == NULL || size < 6) return false;
-
-    for (int i = 0; i < 6; i++) {
-        outArray[i].slotIndex = i;
-
-        uintptr_t addr = GetRelicPointer(i);
-
-        if (addr != 0) {
-            // 读取 3 个正面属性 (偏移 0x18, 0x1C, 0x20)
-            ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x18), &outArray[i].attributes[0], sizeof(uint32_t), NULL);
-            ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x1C), &outArray[i].attributes[1], sizeof(uint32_t), NULL);
-            ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x20), &outArray[i].attributes[2], sizeof(uint32_t), NULL);
-
-            // 读取 3 个负面属性 (偏移 0x40, 0x44, 0x48)
-            ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x40), &outArray[i].debuffs[0], sizeof(uint32_t), NULL);
-            ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x44), &outArray[i].debuffs[1], sizeof(uint32_t), NULL);
-            ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x48), &outArray[i].debuffs[2], sizeof(uint32_t), NULL);
-        } else {
-            // 指针为空，清零
-            memset(outArray[i].attributes, 0, sizeof(outArray[i].attributes));
-            memset(outArray[i].debuffs, 0, sizeof(outArray[i].debuffs));
+        // 第一步：读取装备容器指针 (csgaitem 的上一级)
+        // 使用动态计算的 OFF_EQUIP_CONTAINER
+        uintptr_t containerPtr = 0;
+        if (!ReadProcessMemory(hProcess, (LPCVOID)(gameDataManAddr + OFF_EQUIP_CONTAINER), &containerPtr, sizeof(containerPtr), NULL)) {
+            return 0;
         }
-    }
-    return true;
-}
+        if (containerPtr == 0) return 0;
 
-// 5. 导出函数：用于调试校准 Base Index
-// 如果读出来全是 0，我们可以用 Python 调这个函数来试错，不需要重新编译 C++
-extern "C" __declspec(dllexport) void DebugSetRelicIndex(int newIndex) {
-    RELIC_BASE_INDEX = newIndex;
+        // 第二步：计算数组索引
+        // 逻辑复刻 CT 表: 8 + 8 * (Base + Slot * 4)
+        // RELIC_BASE_INDEX 默认为 29 (可调整)
+        int targetIndex = RELIC_BASE_INDEX + (slot * 4);
+
+        // 第三步：读取具体的遗物指针
+        uintptr_t itemPtrAddr = containerPtr + 0x8 + (targetIndex * 8);
+
+        uintptr_t finalRelicAddr = 0;
+        ReadProcessMemory(hProcess, (LPCVOID)itemPtrAddr, &finalRelicAddr, sizeof(finalRelicAddr), NULL);
+
+        return finalRelicAddr;
+    }
+
+    // 导出 1：读取所有遗物数据
+    __declspec(dllexport) bool GetAllRelics(RelicInfo* outArray, int size) {
+        if (hProcess == NULL || size < 6) return false;
+
+        for (int i = 0; i < 6; i++) {
+            outArray[i].slotIndex = i;
+
+            uintptr_t addr = GetRelicPointer(i);
+
+            if (addr != 0) {
+                // 读取 3 个正面属性 (偏移 0x18, 0x1C, 0x20)
+                ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x18), &outArray[i].attributes[0], sizeof(uint32_t), NULL);
+                ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x1C), &outArray[i].attributes[1], sizeof(uint32_t), NULL);
+                ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x20), &outArray[i].attributes[2], sizeof(uint32_t), NULL);
+
+                // 读取 3 个负面属性 (偏移 0x40, 0x44, 0x48)
+                ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x40), &outArray[i].debuffs[0], sizeof(uint32_t), NULL);
+                ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x44), &outArray[i].debuffs[1], sizeof(uint32_t), NULL);
+                ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x48), &outArray[i].debuffs[2], sizeof(uint32_t), NULL);
+            } else {
+                // 指针为空，清零
+                memset(outArray[i].attributes, 0, sizeof(outArray[i].attributes));
+                memset(outArray[i].debuffs, 0, sizeof(outArray[i].debuffs));
+            }
+        }
+        return true;
+    }
+
+    // 导出 2：用于修改遗物属性
+    // type: 0 = Attribute (正向), 1 = Debuff (负向)
+    // index: 0-2 (第几个词条)
+    // newValue: 新的 ID
+    __declspec(dllexport) bool SetRelicAttribute(int relicSlot, int type, int index, uint32_t newValue) {
+        if (index < 0 || index > 2) return false;
+
+        uintptr_t addr = GetRelicPointer(relicSlot);
+        if (addr == 0) return false;
+
+        uintptr_t targetAddr = 0;
+        if (type == 0) {
+            // Attribute: 0x18 + (index * 4) -> 0x18, 0x1C, 0x20
+            targetAddr = addr + 0x18 + (index * 4);
+        } else {
+            // Debuff: 0x40 + (index * 4) -> 0x40, 0x44, 0x48
+            targetAddr = addr + 0x40 + (index * 4);
+        }
+
+        return WriteProcessMemory(hProcess, (LPVOID)targetAddr, &newValue, sizeof(newValue), NULL);
+    }
+
+    // 导出 3：用于调试校准 Base Index (Python 可随时修改)
+    __declspec(dllexport) void DebugSetRelicIndex(int newIndex) {
+        RELIC_BASE_INDEX = newIndex;
+    }
 }

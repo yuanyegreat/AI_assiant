@@ -7,435 +7,552 @@
 #include <iomanip>
 
 // ==========================================
-// 全局变量
+// 1. 配置与常量定义 (Offsets)
 // ==========================================
-HANDLE hProcess = NULL;
-uintptr_t moduleBase = 0;
-size_t moduleSize = 0;
+namespace Offsets {
+    // 基础偏移
+    const uintptr_t PlayerBase = 0x174E8;
 
-uintptr_t gameDataManAddr = 0;
-uintptr_t worldChrManAddr = 0;
-uintptr_t csGaitemAddr = 0;
-uintptr_t funcAddresses[3] = { 0 };
+    // 属性偏移 (WorldChrMan -> Player -> 0x1B8 -> ...)
+    const uintptr_t HP_Current = 0x140;
+    const uintptr_t HP_Max     = 0x144;
+    const uintptr_t FP_Current = 0x150;
+    const uintptr_t FP_Max     = 0x154;
+    const uintptr_t St_Current = 0x15C;
+    const uintptr_t St_Max     = 0x160;
 
-struct HookInfo {
-    void* caveAddr;
-    uintptr_t targetAddr;
-    BYTE originalBytes[16];
-    int len;
-    bool active;
-} ohkHook = {0};
+    // 冷却/大招偏移
+    const uintptr_t CD_Struct  = 0x148;
+    const uintptr_t Ult_Cur    = 0x14;
+    const uintptr_t Ult_Max    = 0x18;
+    const uintptr_t Skill_Cur  = 0x28;
+    const uintptr_t Skill_Max  = 0x2C;
 
+    // Flags
+    const uintptr_t Flag_Struct = 0x60;
+    const uintptr_t Flag_God    = 0xF8;
+    const uintptr_t Flag_NoDead = 0x189;
+    const uintptr_t Flag_NoGoods= 0x551;
+
+    // 遗物相关
+    const uintptr_t RelicIndexBase = 0x2F4; // PlayerGameData + 0x2F4
+}
+
+// 导出给 Python 的结构体
 struct RelicRawData {
-    int fields[16];
+    int fields[16]; // 覆盖 0x18 到 0x54 (含 Debuff 的 +0x40)
 };
 
-const uintptr_t OFFSET_PLAYER = 0x174E8;
-const uintptr_t OFF_HP_CUR = 0x140;
-const uintptr_t OFF_HP_MAX = 0x144;
-const uintptr_t OFF_FP_CUR = 0x150;
-const uintptr_t OFF_FP_MAX = 0x154;
-const uintptr_t OFF_ST_CUR = 0x15C;
-const uintptr_t OFF_ST_MAX = 0x160;
-const uintptr_t OFF_CD_STRUCT = 0x148;
-const uintptr_t OFF_FLAG_STRUCT = 0x60;
-const uintptr_t OFF_ULT_CUR = 0x14;
-const uintptr_t OFF_ULT_MAX = 0x18;
-const uintptr_t OFF_SKILL_CUR = 0x28;
-const uintptr_t OFF_SKILL_MAX = 0x2C;
-const uintptr_t OFF_GOD_FLAG = 0xF8;
-const uintptr_t OFF_NO_DEAD = 0x189;
-const uintptr_t OFF_NO_GOODS = 0x551;
-
 // ==========================================
-// 工具函数：特征码扫描 (AOB Scan) - 外部进程版
+// 2. 全局游戏上下文 (GameContext)
 // ==========================================
-uintptr_t AOBScanModuleUnique(const std::string& moduleName, const std::string& pattern) {
-    // 1. 解析特征码
-    std::vector<int> patternBytes;
-    std::stringstream ss(pattern);
-    std::string byteStr;
+// 管理进程句柄和关键基址，避免全局变量散乱
+class GameContext {
+public:
+    HANDLE hProcess = NULL;
+    uintptr_t moduleBase = 0;
+    size_t moduleSize = 0;
 
-    while (ss >> byteStr) {
-        if (byteStr == "??" || byteStr == "?") {
-            patternBytes.push_back(-1); // 通配符
-        } else {
-            patternBytes.push_back(std::stoi(byteStr, nullptr, 16));
-        }
+    // 关键基址管理器
+    uintptr_t addrGameDataMan = 0;
+    uintptr_t addrWorldChrMan = 0;
+    uintptr_t addrCSGaitem = 0;
+
+    // 注入用的函数地址缓存
+    uintptr_t funcAddresses[3] = { 0 };
+
+    static GameContext& Instance() {
+        static GameContext instance;
+        return instance;
     }
 
-    if (moduleBase == 0 || hProcess == NULL) return 0;
+    bool IsValid() const {
+        return hProcess != NULL && moduleBase != 0;
+    }
+};
 
-    // 确保 moduleSize 已设置，如果没有则尝试获取（简单的 DOS/NT 头解析）
-    if (moduleSize == 0) {
-        BYTE headerBuffer[0x400];
-        if (ReadProcessMemory(hProcess, (LPCVOID)moduleBase, headerBuffer, sizeof(headerBuffer), 0)) {
-            IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)headerBuffer;
-            if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
-                // 读取 NT 头需要根据 e_lfanew 偏移
-                long ntOffset = dos->e_lfanew;
-                BYTE ntBuffer[0x400];
-                if (ReadProcessMemory(hProcess, (LPCVOID)(moduleBase + ntOffset), ntBuffer, sizeof(ntBuffer), 0)) {
-                    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)ntBuffer;
-                    moduleSize = nt->OptionalHeader.SizeOfImage;
-                }
+// 简化访问宏
+#define G_Ctx GameContext::Instance()
+
+// ==========================================
+// 3. 内存工具类 (MemoryUtils)
+// ==========================================
+class MemoryUtils {
+public:
+    // 获取进程ID
+    static DWORD GetProcId(const char* procName) {
+        DWORD procId = 0;
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32 procEntry;
+            procEntry.dwSize = sizeof(procEntry);
+            if (Process32First(hSnap, &procEntry)) {
+                do {
+                    if (_stricmp(procEntry.szExeFile, procName) == 0) {
+                        procId = procEntry.th32ProcessID;
+                        break;
+                    }
+                } while (Process32Next(hSnap, &procEntry));
             }
         }
+        CloseHandle(hSnap);
+        return procId;
     }
-    if (moduleSize == 0) moduleSize = 0x4000000; // 兜底：如果获取失败，默认扫 64MB
 
-    // 2. 分块扫描逻辑
-    const size_t CHUNK_SIZE = 1024 * 64; // 每次读取 64KB
-    std::vector<BYTE> buffer(CHUNK_SIZE);
-    size_t patternLen = patternBytes.size();
-
-    for (size_t i = 0; i < moduleSize; i += (CHUNK_SIZE - patternLen)) {
-        SIZE_T bytesRead = 0;
-
-        // 从游戏进程读取内存到本地 buffer
-        if (!ReadProcessMemory(hProcess, (LPCVOID)(moduleBase + i), buffer.data(), CHUNK_SIZE, &bytesRead) || bytesRead == 0) {
-            continue;
-        }
-
-        // 在本地 buffer 中进行匹配
-        // 注意：搜索范围是 bytesRead
-        for (size_t j = 0; j < bytesRead; ++j) {
-            // 防止越界
-            if (j + patternLen > bytesRead) break;
-
-            bool found = true;
-            for (size_t k = 0; k < patternLen; ++k) {
-                if (patternBytes[k] != -1 && buffer[j + k] != (BYTE)patternBytes[k]) {
-                    found = false;
-                    break;
-                }
-            }
-
-            if (found) {
-                // 找到后，返回：模块基址 + 当前块偏移(i) + 块内偏移(j)
-                return moduleBase + i + j;
+    // 获取模块基址
+    static uintptr_t GetModuleInfo(DWORD procId, const char* modName, size_t& outSize) {
+        uintptr_t modBaseAddr = 0;
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, procId);
+        if (hSnap != INVALID_HANDLE_VALUE) {
+            MODULEENTRY32 modEntry;
+            modEntry.dwSize = sizeof(modEntry);
+            if (Module32First(hSnap, &modEntry)) {
+                do {
+                    if (_stricmp(modEntry.szModule, modName) == 0) {
+                        modBaseAddr = (uintptr_t)modEntry.modBaseAddr;
+                        outSize = modEntry.modBaseSize;
+                        break;
+                    }
+                } while (Module32Next(hSnap, &modEntry));
             }
         }
+        CloseHandle(hSnap);
+        return modBaseAddr;
     }
 
-    return 0; // 未找到
-}
+    // 指针链读取
+    static uintptr_t GetPtrAddr(uintptr_t base, const std::vector<uintptr_t>& offsets) {
+        if (base == 0) return 0;
+        uintptr_t addr = base;
+        uintptr_t temp = 0;
 
-
-// ==========================================
-// 内部工具函数
-// ==========================================
-DWORD GetProcId(const char* procName) {
-    DWORD procId = 0;
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap != INVALID_HANDLE_VALUE) {
-        PROCESSENTRY32 procEntry;
-        procEntry.dwSize = sizeof(procEntry);
-        if (Process32First(hSnap, &procEntry)) {
-            do {
-                if (_stricmp(procEntry.szExeFile, procName) == 0) {
-                    procId = procEntry.th32ProcessID;
-                    break;
-                }
-            } while (Process32Next(hSnap, &procEntry));
-        }
-    }
-    CloseHandle(hSnap);
-    return procId;
-}
-
-uintptr_t GetModuleInfo(DWORD procId, const char* modName) {
-    uintptr_t modBaseAddr = 0;
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, procId);
-    if (hSnap != INVALID_HANDLE_VALUE) {
-        MODULEENTRY32 modEntry;
-        modEntry.dwSize = sizeof(modEntry);
-        if (Module32First(hSnap, &modEntry)) {
-            do {
-                if (_stricmp(modEntry.szModule, modName) == 0) {
-                    modBaseAddr = (uintptr_t)modEntry.modBaseAddr;
-                    moduleSize = modEntry.modBaseSize;
-                    break;
-                }
-            } while (Module32Next(hSnap, &modEntry));
-        }
-    }
-    CloseHandle(hSnap);
-    return modBaseAddr;
-}
-
-uintptr_t GetPtrAddr(uintptr_t base, const std::vector<uintptr_t>& offsets) {
-    uintptr_t addr = base;
-    uintptr_t temp = 0;
-    ReadProcessMemory(hProcess, (LPCVOID)addr, &temp, 8, 0);
-    addr = temp;
-    if (addr == 0) return 0;
-    for (size_t i = 0; i < offsets.size() - 1; ++i) {
-        ReadProcessMemory(hProcess, (LPCVOID)(addr + offsets[i]), &temp, 8, 0);
+        // 读取基址本身指向的值
+        ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)addr, &temp, 8, 0);
         addr = temp;
         if (addr == 0) return 0;
-    }
-    return addr + offsets.back();
-}
 
-uintptr_t ScanPattern(const std::vector<BYTE>& buffer, const char* pattern, const char* mask) {
-    size_t patternLen = strlen(mask);
-    for (size_t i = 0; i < buffer.size() - patternLen; i++) {
-        bool found = true;
-        for (size_t j = 0; j < patternLen; j++) {
-            if (mask[j] != '?' && pattern[j] != (char)buffer[i + j]) {
-                found = false; break;
+        // 遍历偏移
+        for (size_t i = 0; i < offsets.size() - 1; ++i) {
+            ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)(addr + offsets[i]), &temp, 8, 0);
+            addr = temp;
+            if (addr == 0) return 0;
+        }
+        return addr + offsets.back();
+    }
+
+    // 特征码扫描 (外部进程版，安全分块)
+    static uintptr_t AOBScan(const std::string& pattern) {
+        if (!G_Ctx.IsValid()) return 0;
+
+        std::vector<int> patternBytes;
+        std::stringstream ss(pattern);
+        std::string byteStr;
+        while (ss >> byteStr) {
+            patternBytes.push_back((byteStr == "??" || byteStr == "?") ? -1 : std::stoi(byteStr, nullptr, 16));
+        }
+
+        const size_t CHUNK_SIZE = 1024 * 64;
+        std::vector<BYTE> buffer(CHUNK_SIZE);
+        size_t patternLen = patternBytes.size();
+
+        // 兜底模块大小
+        size_t scanSize = (G_Ctx.moduleSize > 0) ? G_Ctx.moduleSize : 0x4000000;
+
+        for (size_t i = 0; i < scanSize; i += (CHUNK_SIZE - patternLen)) {
+            SIZE_T bytesRead = 0;
+            if (!ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)(G_Ctx.moduleBase + i), buffer.data(), CHUNK_SIZE, &bytesRead) || bytesRead == 0)
+                continue;
+
+            for (size_t j = 0; j < bytesRead; ++j) {
+                if (j + patternLen > bytesRead) break;
+                bool found = true;
+                for (size_t k = 0; k < patternLen; ++k) {
+                    if (patternBytes[k] != -1 && buffer[j + k] != (BYTE)patternBytes[k]) {
+                        found = false; break;
+                    }
+                }
+                if (found) return G_Ctx.moduleBase + i + j;
             }
         }
-        if (found) return moduleBase + i;
+        return 0;
     }
-    return 0;
-}
 
-void ScanFuncs(const std::vector<BYTE>& buffer) {
-    for (size_t i = 4; i < buffer.size() - 3; ++i) {
-        if (buffer[i] == 0x8D && buffer[i+1] == 0x04 && buffer[i+2] == 0x17) {
-            if (buffer[i-3] == 0x8B && buffer[i-2] == 0xD9) {
-                funcAddresses[0] = moduleBase + i - 4 - 0xD;
-                break;
+    // 本地缓冲区扫描 (用于初始化)
+    static uintptr_t ScanPatternInLocalBuffer(const std::vector<BYTE>& buffer, const char* pattern, const char* mask) {
+        size_t patternLen = strlen(mask);
+        for (size_t i = 0; i < buffer.size() - patternLen; i++) {
+            bool found = true;
+            for (size_t j = 0; j < patternLen; j++) {
+                if (mask[j] != '?' && pattern[j] != (char)buffer[i + j]) {
+                    found = false; break;
+                }
+            }
+            if (found) return G_Ctx.moduleBase + i;
+        }
+        return 0;
+    }
+
+    // 在目标附近申请内存 (用于 Hook/Shellcode)
+    static void* AllocNear(uintptr_t targetAddr, size_t size) {
+        SYSTEM_INFO sysInfo;
+        GetSystemInfo(&sysInfo);
+        uintptr_t pageSize = sysInfo.dwAllocationGranularity;
+        uintptr_t startAddr = (targetAddr & ~(pageSize - 1));
+
+        // 向上和向下搜索
+        for (int dir = 0; dir < 2; dir++) {
+            for (size_t i = 0; i < 1024; i++) {
+                uintptr_t attemptAddr = (dir == 0) ? (startAddr + i * pageSize) : (startAddr - i * pageSize);
+                void* pMem = VirtualAllocEx(G_Ctx.hProcess, (LPVOID)attemptAddr, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                if (pMem) {
+                    int64_t diff = (int64_t)pMem - (int64_t)targetAddr;
+                    if (diff > -0x7FFFFFFF && diff < 0x7FFFFFFF) return pMem;
+                    VirtualFreeEx(G_Ctx.hProcess, pMem, 0, MEM_RELEASE);
+                }
             }
         }
+        return nullptr;
     }
-    for (size_t i = 0; i < buffer.size() - 15; ++i) {
-        if (buffer[i]==0x8B && buffer[i+1]==0x81 && buffer[i+2]==0xD0 && buffer[i+3]==0x00) {
-            if (buffer[i+7] == 0x8B && buffer[i+8] == 0xD1 && buffer[i+9] == 0xB9) {
-                funcAddresses[1] = moduleBase + i - 1;
-                break;
-            }
-        }
-    }
-    for (size_t i = 0; i < buffer.size() - 10; ++i) {
-        if (buffer[i]==0x8B && buffer[i+1]==0x41 && buffer[i+2]==0x5C) {
-            if (buffer[i+4] == 0x8B && buffer[i+5] == 0xD1) {
-                funcAddresses[2] = moduleBase + i - 1;
-                break;
-            }
-        }
-    }
-}
-
-// 关键修复：在目标地址附近申请内存 (解决 2GB 跳转崩溃问题)
-void* AllocNear(uintptr_t targetAddr, size_t size) {
-    SYSTEM_INFO sysInfo;
-    GetSystemInfo(&sysInfo);
-    uintptr_t pageSize = sysInfo.dwAllocationGranularity;
-
-    uintptr_t startAddr = (targetAddr & ~(pageSize - 1)); // 对齐
-    uintptr_t minAddr = (uintptr_t)sysInfo.lpMinimumApplicationAddress;
-    uintptr_t maxAddr = (uintptr_t)sysInfo.lpMaximumApplicationAddress;
-
-    // 向上搜寻 (1GB范围内)
-    for (size_t i = 0; i < 1024; i++) {
-        uintptr_t attemptAddr = startAddr + (i * pageSize);
-        if (attemptAddr >= maxAddr) break;
-        // 尝试申请
-        void* pMem = VirtualAllocEx(hProcess, (LPVOID)attemptAddr, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-        if (pMem) {
-            // 检查距离是否在 2GB 内 (int32范围)
-            int64_t diff = (int64_t)pMem - (int64_t)targetAddr;
-            if (diff > -0x7FFFFFFF && diff < 0x7FFFFFFF) return pMem;
-            VirtualFreeEx(hProcess, pMem, 0, MEM_RELEASE);
-        }
-    }
-    // 向下搜寻
-    for (size_t i = 0; i < 1024; i++) {
-        uintptr_t attemptAddr = startAddr - (i * pageSize);
-        if (attemptAddr <= minAddr) break;
-        void* pMem = VirtualAllocEx(hProcess, (LPVOID)attemptAddr, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-        if (pMem) {
-            int64_t diff = (int64_t)pMem - (int64_t)targetAddr;
-            if (diff > -0x7FFFFFFF && diff < 0x7FFFFFFF) return pMem;
-            VirtualFreeEx(hProcess, pMem, 0, MEM_RELEASE);
-        }
-    }
-    return nullptr;
-}
+};
 
 // ==========================================
-// 🚀 导出接口
+// 4. 地址扫描与管理器 (AddressScanner)
 // ==========================================
-extern "C" {
-    __declspec(dllexport) int Connect() {
-        DWORD pid = GetProcId("nightreign.exe");
-        if (pid == 0) return 0;
-        hProcess = OpenProcess(PROCESS_ALL_ACCESS, NULL, pid);
-        moduleBase = GetModuleInfo(pid, "nightreign.exe");
-        return (hProcess && moduleBase && moduleSize > 0) ? 1 : 0;
-    }
-
-    __declspec(dllexport) int ScanAll() {
-        if (!hProcess || !moduleSize) return 0;
-        std::vector<BYTE> buffer(moduleSize);
-        if (!ReadProcessMemory(hProcess, (LPCVOID)moduleBase, buffer.data(), moduleSize, 0)) return 0;
-
-        uintptr_t addrGDM = ScanPattern(buffer, "\x48\x8B\x0D\x00\x00\x00\x00\xF3\x48\x0F\x2C\xC0", "xxx????xxxxx");
+class AddressScanner {
+public:
+    static void ScanCorePtrs(const std::vector<BYTE>& buffer) {
+        // GameDataMan
+        uintptr_t addrGDM = MemoryUtils::ScanPatternInLocalBuffer(buffer, "\x48\x8B\x0D\x00\x00\x00\x00\xF3\x48\x0F\x2C\xC0", "xxx????xxxxx");
         if (addrGDM) {
             int32_t offset = 0;
-            ReadProcessMemory(hProcess, (LPCVOID)(addrGDM + 3), &offset, 4, 0);
-            gameDataManAddr = addrGDM + 7 + offset;
+            ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)(addrGDM + 3), &offset, 4, 0);
+            G_Ctx.addrGameDataMan = addrGDM + 7 + offset;
         }
 
-        uintptr_t addrWCM = ScanPattern(buffer, "\x48\x8B\x05\x00\x00\x00\x00\x0F\x28\xF1\x48\x85\xC0", "xxx????xxxxxx");
+        // WorldChrMan
+        uintptr_t addrWCM = MemoryUtils::ScanPatternInLocalBuffer(buffer, "\x48\x8B\x05\x00\x00\x00\x00\x0F\x28\xF1\x48\x85\xC0", "xxx????xxxxxx");
         if (addrWCM) {
             int32_t offset = 0;
-            ReadProcessMemory(hProcess, (LPCVOID)(addrWCM + 3), &offset, 4, 0);
-            worldChrManAddr = addrWCM + 7 + offset;
+            ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)(addrWCM + 3), &offset, 4, 0);
+            G_Ctx.addrWorldChrMan = addrWCM + 7 + offset;
         }
-
-        ScanFuncs(buffer);
-        return (gameDataManAddr && worldChrManAddr) ? 1 : 0;
     }
 
-    __declspec(dllexport) int ManageStat(int type, int mode, int value) {
-        if (!worldChrManAddr) return -1;
-        uintptr_t offsetCur = 0, offsetMax = 0;
-        if (type == 0) { offsetCur = OFF_HP_CUR; offsetMax = OFF_HP_MAX; }
-        else if (type == 1) { offsetCur = OFF_FP_CUR; offsetMax = OFF_FP_MAX; }
-        else if (type == 2) { offsetCur = OFF_ST_CUR; offsetMax = OFF_ST_MAX; }
+    static void ScanFunctions(const std::vector<BYTE>& buffer) {
+        // 这里保留原本的硬编码扫描逻辑
+        for (size_t i = 4; i < buffer.size() - 3; ++i) {
+            if (buffer[i] == 0x8D && buffer[i+1] == 0x04 && buffer[i+2] == 0x17) {
+                if (buffer[i-3] == 0x8B && buffer[i-2] == 0xD9) {
+                    G_Ctx.funcAddresses[0] = G_Ctx.moduleBase + i - 4 - 0xD;
+                    break;
+                }
+            }
+        }
+        for (size_t i = 0; i < buffer.size() - 15; ++i) {
+            if (buffer[i]==0x8B && buffer[i+1]==0x81 && buffer[i+2]==0xD0 && buffer[i+3]==0x00) {
+                if (buffer[i+7] == 0x8B && buffer[i+8] == 0xD1 && buffer[i+9] == 0xB9) {
+                    G_Ctx.funcAddresses[1] = G_Ctx.moduleBase + i - 1;
+                    break;
+                }
+            }
+        }
+        for (size_t i = 0; i < buffer.size() - 10; ++i) {
+            if (buffer[i]==0x8B && buffer[i+1]==0x41 && buffer[i+2]==0x5C) {
+                if (buffer[i+4] == 0x8B && buffer[i+5] == 0xD1) {
+                    G_Ctx.funcAddresses[2] = G_Ctx.moduleBase + i - 1;
+                    break;
+                }
+            }
+        }
+    }
 
-        std::vector<uintptr_t> chain = {OFFSET_PLAYER, 0x1B8, 0, 0};
-        uintptr_t baseStruct = GetPtrAddr(worldChrManAddr, chain);
+    // 独立扫描 CSGaitem (支持懒加载)
+    static void ScanCSGaitem() {
+        if (G_Ctx.addrCSGaitem != 0) return;
+
+        std::string pattern = "48 8D 44 24 40 48 89 44 24 50 8B 02 89 44 24 40 48 8B 0D";
+        uintptr_t aobResult = MemoryUtils::AOBScan(pattern);
+
+        if (aobResult != 0) {
+            uintptr_t instructionAddr = aobResult + 0x10;
+            int32_t ripOffset = 0;
+            ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)(instructionAddr + 3), &ripOffset, sizeof(ripOffset), 0);
+            G_Ctx.addrCSGaitem = instructionAddr + 7 + ripOffset;
+            std::cout << "[+] CSGaitem found: " << std::hex << G_Ctx.addrCSGaitem << std::dec << std::endl;
+        } else {
+            std::cout << "[-] CSGaitem pattern not found." << std::endl;
+        }
+    }
+};
+
+// ==========================================
+// 5. 玩家管理器 (PlayerManager)
+// ==========================================
+class PlayerManager {
+public:
+    // HP, FP, Stamina
+    static int ManageStat(int type, int mode, int value) {
+        if (!G_Ctx.addrWorldChrMan) return -1;
+        uintptr_t offCur = 0, offMax = 0;
+
+        switch(type) {
+            case 0: offCur = Offsets::HP_Current; offMax = Offsets::HP_Max; break;
+            case 1: offCur = Offsets::FP_Current; offMax = Offsets::FP_Max; break;
+            case 2: offCur = Offsets::St_Current; offMax = Offsets::St_Max; break;
+            default: return -1;
+        }
+
+        uintptr_t baseStruct = MemoryUtils::GetPtrAddr(G_Ctx.addrWorldChrMan, {Offsets::PlayerBase, 0x1B8, 0, 0});
         if (!baseStruct) return -1;
 
-        if (mode == 0) {
+        if (mode == 0) { // Read
             int val = 0;
-            ReadProcessMemory(hProcess, (LPCVOID)(baseStruct + offsetCur), &val, 4, 0);
+            ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)(baseStruct + offCur), &val, 4, 0);
             return val;
-        }
-        else if (mode == 1) {
-            WriteProcessMemory(hProcess, (LPVOID)(baseStruct + offsetCur), &value, 4, 0);
+        } else if (mode == 1) { // Write
+            WriteProcessMemory(G_Ctx.hProcess, (LPVOID)(baseStruct + offCur), &value, 4, 0);
             return 1;
-        }
-        else if (mode == 2) {
+        } else if (mode == 2) { // Max
             int maxVal = 0;
-            ReadProcessMemory(hProcess, (LPCVOID)(baseStruct + offsetMax), &maxVal, 4, 0);
-            WriteProcessMemory(hProcess, (LPVOID)(baseStruct + offsetCur), &maxVal, 4, 0);
+            ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)(baseStruct + offMax), &maxVal, 4, 0);
+            WriteProcessMemory(G_Ctx.hProcess, (LPVOID)(baseStruct + offCur), &maxVal, 4, 0);
             return maxVal;
         }
         return 0;
     }
 
-    __declspec(dllexport) float ManageFloat(int type, int mode, float value) {
-        if (!worldChrManAddr) return -1.0f;
-        std::vector<uintptr_t> chain = {OFFSET_PLAYER, 0x1B8, OFF_CD_STRUCT, 0};
-        uintptr_t baseStruct = GetPtrAddr(worldChrManAddr, chain);
-        if (!baseStruct) return -1.0f;
+    // Ult, Skill CD
+    static float ManageFloat(int type, int mode, float value) {
+        if (!G_Ctx.addrWorldChrMan) return -1.0f;
 
-        uintptr_t offsetCur = 0, offsetMax = 0;
-        if (type == 0) { offsetCur = OFF_ULT_CUR; offsetMax = OFF_ULT_MAX; }
-        else if (type == 1) { offsetCur = OFF_SKILL_CUR; offsetMax = OFF_SKILL_MAX; }
+        uintptr_t offCur = 0, offMax = 0;
+        if (type == 0) { offCur = Offsets::Ult_Cur; offMax = Offsets::Ult_Max; }
+        else { offCur = Offsets::Skill_Cur; offMax = Offsets::Skill_Max; }
+
+        uintptr_t baseStruct = MemoryUtils::GetPtrAddr(G_Ctx.addrWorldChrMan, {Offsets::PlayerBase, 0x1B8, Offsets::CD_Struct, 0});
+        if (!baseStruct) return -1.0f;
 
         if (mode == 0) {
             float val = 0.0f;
-            ReadProcessMemory(hProcess, (LPCVOID)(baseStruct + offsetCur), &val, 4, 0);
+            ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)(baseStruct + offCur), &val, 4, 0);
             return val;
-        }
-        else if (mode == 1) {
-            WriteProcessMemory(hProcess, (LPVOID)(baseStruct + offsetCur), &value, 4, 0);
+        } else if (mode == 1) {
+            WriteProcessMemory(G_Ctx.hProcess, (LPVOID)(baseStruct + offCur), &value, 4, 0);
             return 1.0f;
-        }
-        else if (mode == 2) {
+        } else if (mode == 2) {
             float maxVal = 0.0f;
-            if (type == 0) ReadProcessMemory(hProcess, (LPCVOID)(baseStruct + offsetMax), &maxVal, 4, 0);
-            WriteProcessMemory(hProcess, (LPVOID)(baseStruct + offsetCur), &maxVal, 4, 0);
+            if(type == 0) ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)(baseStruct + offMax), &maxVal, 4, 0);
+            WriteProcessMemory(G_Ctx.hProcess, (LPVOID)(baseStruct + offCur), &maxVal, 4, 0);
             return maxVal;
         }
         return 0.0f;
     }
 
-    __declspec(dllexport) int SetFlag(int type, int enable) {
-        if (!worldChrManAddr) return 0;
+    // Flags (GodMode etc)
+    static int SetFlag(int type, int enable) {
+        if (!G_Ctx.addrWorldChrMan) return 0;
         uintptr_t targetAddr = 0;
         int bitPos = 0;
 
-        if (type == 0) {
-            targetAddr = GetPtrAddr(worldChrManAddr, {OFFSET_PLAYER, OFF_FLAG_STRUCT, OFF_GOD_FLAG});
+        if (type == 0) { // God Mode
+            targetAddr = MemoryUtils::GetPtrAddr(G_Ctx.addrWorldChrMan, {Offsets::PlayerBase, Offsets::Flag_Struct, Offsets::Flag_God});
             BYTE val = enable ? 1 : 0;
-            WriteProcessMemory(hProcess, (LPVOID)targetAddr, &val, 1, 0);
+            WriteProcessMemory(G_Ctx.hProcess, (LPVOID)targetAddr, &val, 1, 0);
             return 1;
         }
-        if (type == 4) {
-            targetAddr = GetPtrAddr(worldChrManAddr, {OFFSET_PLAYER, OFF_NO_GOODS});
+
+        // Bit Flags
+        if (type == 4) { // No Consume
+            targetAddr = MemoryUtils::GetPtrAddr(G_Ctx.addrWorldChrMan, {Offsets::PlayerBase, Offsets::Flag_NoGoods});
             bitPos = 7;
         } else {
-            targetAddr = GetPtrAddr(worldChrManAddr, {OFFSET_PLAYER, 0x1B8, 0, OFF_NO_DEAD});
-            if (type == 1) bitPos = 2;
-            else if (type == 2) bitPos = 5;
-            else if (type == 3) bitPos = 4;
+            targetAddr = MemoryUtils::GetPtrAddr(G_Ctx.addrWorldChrMan, {Offsets::PlayerBase, 0x1B8, 0, Offsets::Flag_NoDead});
+            if (type == 1) bitPos = 2; // No Dead
+            else if (type == 2) bitPos = 5; // No Stamina
+            else if (type == 3) bitPos = 4; // No FP
         }
-        if (!targetAddr) return 0;
 
+        if (!targetAddr) return 0;
         BYTE current = 0;
-        ReadProcessMemory(hProcess, (LPCVOID)targetAddr, &current, 1, 0);
+        ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)targetAddr, &current, 1, 0);
         BYTE newVal = current;
         if (enable) newVal |= (1 << bitPos);
         else newVal &= ~(1 << bitPos);
-        if (newVal != current) WriteProcessMemory(hProcess, (LPVOID)targetAddr, &newVal, 1, 0);
+
+        if (newVal != current) WriteProcessMemory(G_Ctx.hProcess, (LPVOID)targetAddr, &newVal, 1, 0);
+        return 1;
+    }
+};
+
+// ==========================================
+// 6. 遗物/物品管理器 (InventoryManager)
+// ==========================================
+class InventoryManager {
+public:
+    static int GetAllRelics(RelicRawData* outBuffer) {
+        // 确保 CSGaitem 已初始化
+        AddressScanner::ScanCSGaitem();
+        if (G_Ctx.addrGameDataMan == 0 || G_Ctx.addrCSGaitem == 0) return 0;
+
+        uintptr_t ptrToPlayerGameData = 0;
+        ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)G_Ctx.addrGameDataMan, &ptrToPlayerGameData, 8, 0);
+        if (!ptrToPlayerGameData) return 0;
+
+        uintptr_t playerGameData = 0;
+        ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)(ptrToPlayerGameData + 0x8), &playerGameData, 8, 0);
+        if (!playerGameData) return 0;
+
+        uintptr_t gaitemManager = 0;
+        ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)G_Ctx.addrCSGaitem, &gaitemManager, 8, 0);
+        if (!gaitemManager) return 0;
+
+        // 循环读取 6 个遗物
+        for (int i = 0; i < 6; i++) {
+            uintptr_t indexAddr = playerGameData + Offsets::RelicIndexBase + (i * 4);
+            int16_t relicIndex = -1;
+
+            if (!ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)indexAddr, &relicIndex, 2, 0) || relicIndex < 0) {
+                FillEmpty(outBuffer[i]);
+                continue;
+            }
+
+            uintptr_t itemPtrLocation = gaitemManager + 0x8 + (relicIndex * 8);
+            uintptr_t itemAddr = 0;
+            ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)itemPtrLocation, &itemAddr, 8, 0);
+
+            if (itemAddr == 0) {
+                FillEmpty(outBuffer[i]);
+                continue;
+            }
+
+            // 读取从 0x18 开始的 16 个整数 (覆盖到 0x54)
+            if (!ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)(itemAddr + 0x18), outBuffer[i].fields, sizeof(int) * 16, 0)) {
+                FillEmpty(outBuffer[i]);
+            }
+        }
         return 1;
     }
 
-    __declspec(dllexport) int InjectAddValue(int target, int value) {
-        if (!hProcess || !gameDataManAddr) return 0;
-        uintptr_t funcAddr = funcAddresses[target];
+    static int SetRelicData(int relicIndex, int fieldIndex, int value) {
+        // 1. 初始化与地址检查
+        AddressScanner::ScanCSGaitem();
+        if (G_Ctx.addrGameDataMan == 0 || G_Ctx.addrCSGaitem == 0) return 0;
+
+        uintptr_t ptrToPlayerGameData = 0;
+        ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)G_Ctx.addrGameDataMan, &ptrToPlayerGameData, 8, 0);
+        if (!ptrToPlayerGameData) return 0;
+
+        uintptr_t playerGameData = 0;
+        ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)(ptrToPlayerGameData + 0x8), &playerGameData, 8, 0);
+        if (!playerGameData) return 0;
+
+        uintptr_t gaitemManager = 0;
+        ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)G_Ctx.addrCSGaitem, &gaitemManager, 8, 0);
+        if (!gaitemManager) return 0;
+
+        // 2. 获取目标遗物的 Index
+        uintptr_t indexAddr = playerGameData + Offsets::RelicIndexBase + (relicIndex * 4);
+        int16_t currentRelicIndex = -1;
+        if (!ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)indexAddr, &currentRelicIndex, 2, 0) || currentRelicIndex < 0) {
+            return -2; // 遗物槽为空
+        }
+
+        // 3. 获取遗物实体的内存地址
+        uintptr_t itemPtrLocation = gaitemManager + 0x8 + (currentRelicIndex * 8);
+        uintptr_t itemAddr = 0;
+        ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)itemPtrLocation, &itemAddr, 8, 0);
+        if (itemAddr == 0) return -2;
+
+        // 4. 计算目标字段地址并写入
+        // Base = 0x18
+        // Target = 0x18 + (fieldIndex * 4)
+        uintptr_t targetFieldAddr = itemAddr + 0x18 + (fieldIndex * 4);
+
+        if (WriteProcessMemory(G_Ctx.hProcess, (LPVOID)targetFieldAddr, &value, 4, 0)) {
+            return 1; // 成功
+        }
+        return 0; // 写入失败
+    }
+
+private:
+    static void FillEmpty(RelicRawData& data) {
+        for(int k=0; k<16; k++) data.fields[k] = -1;
+    }
+};
+
+// ==========================================
+// 7. 作弊功能管理器 (CheatManager)
+// ==========================================
+class CheatManager {
+    struct HookInfo {
+        void* caveAddr;
+        uintptr_t targetAddr;
+        BYTE originalBytes[16];
+        int len;
+        bool active;
+    };
+    static HookInfo ohkHook;
+
+public:
+    static int InjectAddValue(int target, int value) {
+        if (!G_Ctx.IsValid() || !G_Ctx.addrGameDataMan) return 0;
+        uintptr_t funcAddr = G_Ctx.funcAddresses[target];
         if (funcAddr == 0) return -1;
+
         uintptr_t gdmPtr = 0;
-        ReadProcessMemory(hProcess, (LPCVOID)gameDataManAddr, &gdmPtr, 8, 0);
+        ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)G_Ctx.addrGameDataMan, &gdmPtr, 8, 0);
         if (!gdmPtr) return -2;
+
         uintptr_t playerDataPtr = 0;
-        ReadProcessMemory(hProcess, (LPCVOID)(gdmPtr + 0x8), &playerDataPtr, 8, 0);
+        ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)(gdmPtr + 0x8), &playerDataPtr, 8, 0);
         if (!playerDataPtr) return -2;
 
-        void* shellcodeAddr = AllocNear(gdmPtr, 1024); // 尝试分配附近内存，虽然CreateRemoteThread不严格要求
-        if (!shellcodeAddr) shellcodeAddr = VirtualAllocEx(hProcess, NULL, 1024, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        void* shellcodeAddr = MemoryUtils::AllocNear(gdmPtr, 1024);
+        if (!shellcodeAddr) shellcodeAddr = VirtualAllocEx(G_Ctx.hProcess, NULL, 1024, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
         if (!shellcodeAddr) return 0;
 
         BYTE code[64];
         int idx = 0;
+        // mov rcx, playerDataPtr
         code[idx++] = 0x48; code[idx++] = 0xB9; *(uint64_t*)&code[idx] = playerDataPtr; idx += 8;
+        // mov edx, value
         code[idx++] = 0xBA; *(uint32_t*)&code[idx] = value; idx += 4;
+        // mov rax, funcAddr
         code[idx++] = 0x48; code[idx++] = 0xB8; *(uint64_t*)&code[idx] = funcAddr; idx += 8;
+        // Call & cleanup
         BYTE suffix[] = {0x48, 0x83, 0xEC, 0x28, 0xFF, 0xD0, 0x48, 0x83, 0xC4, 0x28, 0xC3};
         memcpy(&code[idx], suffix, sizeof(suffix));
         idx += sizeof(suffix);
 
-        WriteProcessMemory(hProcess, shellcodeAddr, code, idx, 0);
-        HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)shellcodeAddr, NULL, 0, NULL);
+        WriteProcessMemory(G_Ctx.hProcess, shellcodeAddr, code, idx, 0);
+        HANDLE hThread = CreateRemoteThread(G_Ctx.hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)shellcodeAddr, NULL, 0, NULL);
         if (hThread) { WaitForSingleObject(hThread, INFINITE); CloseHandle(hThread); }
-        VirtualFreeEx(hProcess, shellcodeAddr, 0, MEM_RELEASE);
+        VirtualFreeEx(G_Ctx.hProcess, shellcodeAddr, 0, MEM_RELEASE);
         return 1;
     }
 
-    // ==========================================
-    // ⚔️ 终极修正版: 一击必杀 (防崩溃)
-    // ==========================================
-    __declspec(dllexport) int SetOneHitKill(int enable) {
-        if (!hProcess || !moduleSize || !worldChrManAddr) return 0;
+    static int SetOneHitKill(int enable) {
+        if (!G_Ctx.IsValid() || !G_Ctx.addrWorldChrMan) return 0;
 
         if (enable) {
             if (ohkHook.active) return 1;
 
-            // 1. 扫描目标: mov eax, [rax+140] (8B 80 40 01 00 00)
-            std::vector<BYTE> buffer(moduleSize);
-            ReadProcessMemory(hProcess, (LPCVOID)moduleBase, buffer.data(), moduleSize, 0);
-            uintptr_t target = ScanPattern(buffer, "\x8B\x80\x40\x01\x00\x00\x48\x83", "xxxxxxxx");
+            std::vector<BYTE> buffer(G_Ctx.moduleSize);
+            ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)G_Ctx.moduleBase, buffer.data(), G_Ctx.moduleSize, 0);
+
+            // mov eax, [rax+140]
+            uintptr_t target = MemoryUtils::ScanPatternInLocalBuffer(buffer, "\x8B\x80\x40\x01\x00\x00\x48\x83", "xxxxxxxx");
             if (!target) return -1;
 
-            uintptr_t playerEntity = GetPtrAddr(worldChrManAddr, {OFFSET_PLAYER, 0x1B8, 0});
+            uintptr_t playerEntity = MemoryUtils::GetPtrAddr(G_Ctx.addrWorldChrMan, {Offsets::PlayerBase, 0x1B8, 0});
             if (!playerEntity) return -2;
 
-            // ⚠️ 关键修复：申请内存必须在 Target 附近 (±2GB)，否则 JMP 会崩溃
-            void* cave = AllocNear(target, 1024);
-            if (!cave) return 0; // 申请失败
+            void* cave = MemoryUtils::AllocNear(target, 1024);
+            if (!cave) return 0;
 
             BYTE code[128];
             int idx = 0;
-
-            // --- Shellcode ---
+            // 逻辑: 检查是否是玩家，是则写入，否则正常执行
             // push rbx
             code[idx++] = 0x53;
             // mov rbx, playerEntity
@@ -444,38 +561,27 @@ extern "C" {
             code[idx++] = 0x48; code[idx++] = 0x39; code[idx++] = 0xD8;
             // pop rbx
             code[idx++] = 0x5B;
-            // je +10 (如果是玩家，跳过写0操作)
+            // je +10 (Skip if player)
             code[idx++] = 0x74; code[idx++] = 0x0A;
+            // mov [rax+140], 0 (Kill Enemy)
+            code[idx++] = 0xC7; code[idx++] = 0x80; *(uint32_t*)&code[idx] = 0x140; idx += 4; *(uint32_t*)&code[idx] = 0; idx += 4;
+            // Original Instruction
+            code[idx++] = 0x8B; code[idx++] = 0x80; *(uint32_t*)&code[idx] = 0x140; idx += 4;
+            // Jump Back
+            code[idx++] = 0xFF; code[idx++] = 0x25; *(int32_t*)&code[idx] = 0; idx += 4;
+            *(uint64_t*)&code[idx] = target + 6; idx += 8;
 
-            // mov [rax+140], 0 (写入 0 血量)
-            code[idx++] = 0xC7; code[idx++] = 0x80;
-            *(uint32_t*)&code[idx] = 0x140; idx += 4;
-            *(uint32_t*)&code[idx] = 0; idx += 4;
+            WriteProcessMemory(G_Ctx.hProcess, cave, code, idx, 0);
 
-            // Original: mov eax, [rax+140] (还原被覆盖的指令)
-            code[idx++] = 0x8B; code[idx++] = 0x80;
-            *(uint32_t*)&code[idx] = 0x140; idx += 4;
-
-            // ⚠️ 关键修复：使用绝对跳转跳回 (Absolute Jump)
-            // 防止跳回距离过远导致崩溃。格式: FF 25 00 00 00 00 [Address]
-            code[idx++] = 0xFF; code[idx++] = 0x25;
-            *(int32_t*)&code[idx] = 0; idx += 4; // RIP+0
-            uintptr_t backAddr = target + 6; // 跳回原指令下一条
-            *(uint64_t*)&code[idx] = backAddr; idx += 8;
-
-            WriteProcessMemory(hProcess, cave, code, idx, 0);
-
-            // --- Apply Hook ---
+            // Apply Hook
             BYTE patch[6];
-            patch[0] = 0xE9; // JMP
-            // 计算相对偏移 (现在 cave 一定在 2GB 内，所以是安全的)
+            patch[0] = 0xE9;
             int64_t diff = (int64_t)cave - (int64_t)target - 5;
             *(int32_t*)&patch[1] = (int32_t)diff;
-            patch[5] = 0x90; // NOP
+            patch[5] = 0x90;
 
-            // 备份并写入
-            ReadProcessMemory(hProcess, (LPCVOID)target, ohkHook.originalBytes, 6, 0);
-            WriteProcessMemory(hProcess, (LPVOID)target, patch, 6, 0);
+            ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)target, ohkHook.originalBytes, 6, 0);
+            WriteProcessMemory(G_Ctx.hProcess, (LPVOID)target, patch, 6, 0);
 
             ohkHook.caveAddr = cave;
             ohkHook.targetAddr = target;
@@ -484,109 +590,72 @@ extern "C" {
             return 1;
         } else {
             if (!ohkHook.active) return 1;
-            WriteProcessMemory(hProcess, (LPVOID)ohkHook.targetAddr, ohkHook.originalBytes, ohkHook.len, 0);
-            VirtualFreeEx(hProcess, ohkHook.caveAddr, 0, MEM_RELEASE);
+            WriteProcessMemory(G_Ctx.hProcess, (LPVOID)ohkHook.targetAddr, ohkHook.originalBytes, ohkHook.len, 0);
+            VirtualFreeEx(G_Ctx.hProcess, ohkHook.caveAddr, 0, MEM_RELEASE);
             ohkHook.active = false;
             return 1;
         }
     }
-}
+};
+// 初始化静态成员
+CheatManager::HookInfo CheatManager::ohkHook = {0};
 
 
-// ==========================================\r
-// 新增逻辑：获取护符/遗物属性
-// ==========================================\r
-extern "C" __declspec(dllexport) void InitCSGaitemAddress() {
-    if (csGaitemAddr != 0) return; // 避免重复扫描
-
-    // Cheat Engine 脚本里的特征码
-    // 注意：Lua脚本里 offset=0x10 指向的是 "48 8B 0D..." 这条指令
-    // 我们直接扫描这条指令及其上下文
-    // 原始特征码片段: 48 8D 44 24 40 ... (省略) ... 48 8B 0D
-
-    // 为了稳健，我们使用脚本中定义的 CSGaitem 关键特征码
-    // 对应 Lua: {name = "CSGaitem", aob = "48 8D 44 24 40 48 89 44 24 50 8B 02 89 44 24 40 48 8B 0D"}
-    // 这里的最后部分 48 8B 0D 就是我们要解引用的地方
-
-    std::string pattern = "48 8D 44 24 40 48 89 44 24 50 8B 02 89 44 24 40 48 8B 0D";
-    uintptr_t aobResult = AOBScanModuleUnique("nightreign.exe", pattern);
-
-    if (aobResult != 0) {
-        // Lua脚本中 offset = 0x10 (16 dec)。
-        // 意思是从找到的地址开始，往后数 16 个字节，才是我们要解析的指令 (48 8B 0D ...)
-        uintptr_t instructionAddr = aobResult + 0x10;
-
-        // 解析 RIP 寻址: 48 8B 0D [Offset]
-        // [Offset] 是 4字节整数 (int32_t)
-        int32_t ripOffset = 0;
-        // 读取指令后的 4 个字节
-        // 指令结构: OpCode(3 bytes: 48 8B 0D) + Offset(4 bytes)
-        ReadProcessMemory(hProcess, (LPCVOID)(instructionAddr + 3), &ripOffset, sizeof(ripOffset), 0);
-
-        // 目标地址 = 当前指令地址 + 指令长度(7) + 偏移量
-        csGaitemAddr = instructionAddr + 7 + ripOffset;
-
-        std::cout << "[+] CSGaitem Address found: " << std::hex << csGaitemAddr << std::dec << std::endl;
-    } else {
-        std::cout << "[-] Failed to find CSGaitem pattern." << std::endl;
-    }
-}
-
-
-
-extern "C" __declspec(dllexport) int GetAllRelics(RelicRawData* outBuffer) {
-    // 确保已初始化
-    if (csGaitemAddr == 0) InitCSGaitemAddress();
-    if (gameDataManAddr == 0 || csGaitemAddr == 0) return 0;
-
-    // 1. 获取 PlayerGameData 指针
-    uintptr_t ptrToPlayerGameData = 0;
-    ReadProcessMemory(hProcess, (LPCVOID)gameDataManAddr, &ptrToPlayerGameData, sizeof(ptrToPlayerGameData), 0);
-    if (ptrToPlayerGameData == 0) return 0;
-
-    uintptr_t playerGameData = 0;
-    ReadProcessMemory(hProcess, (LPCVOID)(ptrToPlayerGameData + 0x8), &playerGameData, sizeof(playerGameData), 0);
-    if (playerGameData == 0) return 0;
-
-    // 2. 获取 CSGaitem Manager 基址
-    uintptr_t gaitemManager = 0;
-    ReadProcessMemory(hProcess, (LPCVOID)csGaitemAddr, &gaitemManager, sizeof(gaitemManager), 0);
-    if (gaitemManager == 0) return 0;
-
-    // 3. 循环读取 6 个遗物
-    for (int i = 0; i < 6; i++) {
-        // 计算索引地址：0x2F4 + (i * 4)
-        uintptr_t indexAddr = playerGameData + 0x2F4 + (i * 4);
-        int16_t relicIndex = -1;
-
-        // 读取索引 (2字节)
-        if (!ReadProcessMemory(hProcess, (LPCVOID)indexAddr, &relicIndex, sizeof(relicIndex), 0)) {
-            // 读取失败，全部填 -1
-            for(int k=0; k<16; k++) outBuffer[i].fields[k] = -1;
-            continue;
-        }
-
-        // 索引无效判断
-        if (relicIndex < 0) {
-            for(int k=0; k<16; k++) outBuffer[i].fields[k] = -1;
-            continue;
-        }
-
-        // 计算物品地址: Manager + 8 + (Index * 8)
-        uintptr_t itemPtrLocation = gaitemManager + 0x8 + (relicIndex * 8);
-        uintptr_t itemAddr = 0;
-        ReadProcessMemory(hProcess, (LPCVOID)itemPtrLocation, &itemAddr, sizeof(itemAddr), 0);
-
-        if (itemAddr == 0) {
-            for(int k=0; k<16; k++) outBuffer[i].fields[k] = -1;
-            continue;
-        }
-
-        // 关键修改：一次性读取 16 个整数 (64 字节)，从偏移 0x18 开始
-        if (!ReadProcessMemory(hProcess, (LPCVOID)(itemAddr + 0x18), outBuffer[i].fields, sizeof(int) * 16, 0)) {
-             for(int k=0; k<16; k++) outBuffer[i].fields[k] = -1;
-        }
+// ==========================================
+// 8. 外部接口 (Extern "C" Exports)
+// ==========================================
+// 这一层保持不变，作为 Python ctypes 的接口层
+extern "C" {
+    __declspec(dllexport) int Connect() {
+        DWORD pid = MemoryUtils::GetProcId("nightreign.exe");
+        if (pid == 0) return 0;
+        G_Ctx.hProcess = OpenProcess(PROCESS_ALL_ACCESS, NULL, pid);
+        G_Ctx.moduleBase = MemoryUtils::GetModuleInfo(pid, "nightreign.exe", G_Ctx.moduleSize);
+        return G_Ctx.IsValid() ? 1 : 0;
     }
 
-    return 1; // 成功
+    __declspec(dllexport) int ScanAll() {
+        if (!G_Ctx.IsValid()) return 0;
+        std::vector<BYTE> buffer(G_Ctx.moduleSize);
+        if (!ReadProcessMemory(G_Ctx.hProcess, (LPCVOID)G_Ctx.moduleBase, buffer.data(), G_Ctx.moduleSize, 0)) return 0;
+
+        AddressScanner::ScanCorePtrs(buffer);
+        AddressScanner::ScanFunctions(buffer);
+        // CSGaitem 留给 GetAllRelics 懒加载，或者这里也可以加 AddressScanner::ScanCSGaitem();
+
+        return (G_Ctx.addrGameDataMan && G_Ctx.addrWorldChrMan) ? 1 : 0;
+    }
+
+    __declspec(dllexport) int ManageStat(int type, int mode, int value) {
+        return PlayerManager::ManageStat(type, mode, value);
+    }
+
+    __declspec(dllexport) float ManageFloat(int type, int mode, float value) {
+        return PlayerManager::ManageFloat(type, mode, value);
+    }
+
+    __declspec(dllexport) int SetFlag(int type, int enable) {
+        return PlayerManager::SetFlag(type, enable);
+    }
+
+    __declspec(dllexport) int InjectAddValue(int target, int value) {
+        return CheatManager::InjectAddValue(target, value);
+    }
+
+    __declspec(dllexport) int SetOneHitKill(int enable) {
+        return CheatManager::SetOneHitKill(enable);
+    }
+
+    // 遗物相关接口
+    __declspec(dllexport) void InitCSGaitemAddress() {
+        AddressScanner::ScanCSGaitem();
+    }
+
+    __declspec(dllexport) int GetAllRelics(RelicRawData* outBuffer) {
+        return InventoryManager::GetAllRelics(outBuffer);
+    }
+
+    __declspec(dllexport) int SetRelicData(int relicIndex, int fieldIndex, int value) {
+        return InventoryManager::SetRelicData(relicIndex, fieldIndex, value);
+    }
 }

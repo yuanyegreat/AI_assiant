@@ -13,7 +13,7 @@ size_t moduleSize = 0;
 
 uintptr_t gameDataManAddr = 0;
 uintptr_t worldChrManAddr = 0;
-uintptr_t funcAddresses[3] = { 0 }; 
+uintptr_t funcAddresses[3] = { 0 };
 
 struct HookInfo {
     void* caveAddr;
@@ -37,8 +37,8 @@ const uintptr_t OFF_ULT_MAX = 0x18;
 const uintptr_t OFF_SKILL_CUR = 0x28;
 const uintptr_t OFF_SKILL_MAX = 0x2C;
 const uintptr_t OFF_GOD_FLAG = 0xF8;
-const uintptr_t OFF_NO_DEAD = 0x189; 
-const uintptr_t OFF_NO_GOODS = 0x551; 
+const uintptr_t OFF_NO_DEAD = 0x189;
+const uintptr_t OFF_NO_GOODS = 0x551;
 
 // ==========================================
 // 内部工具函数
@@ -212,24 +212,24 @@ extern "C" {
     __declspec(dllexport) int ManageStat(int type, int mode, int value) {
         if (!worldChrManAddr) return -1;
         uintptr_t offsetCur = 0, offsetMax = 0;
-        if (type == 0) { offsetCur = OFF_HP_CUR; offsetMax = OFF_HP_MAX; } 
+        if (type == 0) { offsetCur = OFF_HP_CUR; offsetMax = OFF_HP_MAX; }
         else if (type == 1) { offsetCur = OFF_FP_CUR; offsetMax = OFF_FP_MAX; }
         else if (type == 2) { offsetCur = OFF_ST_CUR; offsetMax = OFF_ST_MAX; }
 
-        std::vector<uintptr_t> chain = {OFFSET_PLAYER, 0x1B8, 0, 0}; 
+        std::vector<uintptr_t> chain = {OFFSET_PLAYER, 0x1B8, 0, 0};
         uintptr_t baseStruct = GetPtrAddr(worldChrManAddr, chain);
         if (!baseStruct) return -1;
 
-        if (mode == 0) { 
+        if (mode == 0) {
             int val = 0;
             ReadProcessMemory(hProcess, (LPCVOID)(baseStruct + offsetCur), &val, 4, 0);
             return val;
-        } 
-        else if (mode == 1) { 
+        }
+        else if (mode == 1) {
             WriteProcessMemory(hProcess, (LPVOID)(baseStruct + offsetCur), &value, 4, 0);
             return 1;
         }
-        else if (mode == 2) { 
+        else if (mode == 2) {
             int maxVal = 0;
             ReadProcessMemory(hProcess, (LPCVOID)(baseStruct + offsetMax), &maxVal, 4, 0);
             WriteProcessMemory(hProcess, (LPVOID)(baseStruct + offsetCur), &maxVal, 4, 0);
@@ -282,9 +282,9 @@ extern "C" {
             bitPos = 7;
         } else {
             targetAddr = GetPtrAddr(worldChrManAddr, {OFFSET_PLAYER, 0x1B8, 0, OFF_NO_DEAD});
-            if (type == 1) bitPos = 2; 
-            else if (type == 2) bitPos = 5; 
-            else if (type == 3) bitPos = 4; 
+            if (type == 1) bitPos = 2;
+            else if (type == 2) bitPos = 5;
+            else if (type == 3) bitPos = 4;
         }
         if (!targetAddr) return 0;
 
@@ -300,7 +300,7 @@ extern "C" {
     __declspec(dllexport) int InjectAddValue(int target, int value) {
         if (!hProcess || !gameDataManAddr) return 0;
         uintptr_t funcAddr = funcAddresses[target];
-        if (funcAddr == 0) return -1; 
+        if (funcAddr == 0) return -1;
         uintptr_t gdmPtr = 0;
         ReadProcessMemory(hProcess, (LPCVOID)gameDataManAddr, &gdmPtr, 8, 0);
         if (!gdmPtr) return -2;
@@ -335,16 +335,16 @@ extern "C" {
         if (!hProcess || !moduleSize || !worldChrManAddr) return 0;
 
         if (enable) {
-            if (ohkHook.active) return 1; 
+            if (ohkHook.active) return 1;
 
             // 1. 扫描目标: mov eax, [rax+140] (8B 80 40 01 00 00)
             std::vector<BYTE> buffer(moduleSize);
             ReadProcessMemory(hProcess, (LPCVOID)moduleBase, buffer.data(), moduleSize, 0);
             uintptr_t target = ScanPattern(buffer, "\x8B\x80\x40\x01\x00\x00\x48\x83", "xxxxxxxx");
-            if (!target) return -1; 
+            if (!target) return -1;
 
             uintptr_t playerEntity = GetPtrAddr(worldChrManAddr, {OFFSET_PLAYER, 0x1B8, 0});
-            if (!playerEntity) return -2; 
+            if (!playerEntity) return -2;
 
             // ⚠️ 关键修复：申请内存必须在 Target 附近 (±2GB)，否则 JMP 会崩溃
             void* cave = AllocNear(target, 1024);
@@ -355,15 +355,15 @@ extern "C" {
 
             // --- Shellcode ---
             // push rbx
-            code[idx++] = 0x53; 
+            code[idx++] = 0x53;
             // mov rbx, playerEntity
             code[idx++] = 0x48; code[idx++] = 0xBB; *(uint64_t*)&code[idx] = playerEntity; idx += 8;
             // cmp rax, rbx
-            code[idx++] = 0x48; code[idx++] = 0x39; code[idx++] = 0xD8; 
+            code[idx++] = 0x48; code[idx++] = 0x39; code[idx++] = 0xD8;
             // pop rbx
-            code[idx++] = 0x5B; 
+            code[idx++] = 0x5B;
             // je +10 (如果是玩家，跳过写0操作)
-            code[idx++] = 0x74; code[idx++] = 0x0A; 
+            code[idx++] = 0x74; code[idx++] = 0x0A;
 
             // mov [rax+140], 0 (写入 0 血量)
             code[idx++] = 0xC7; code[idx++] = 0x80;
@@ -408,4 +408,82 @@ extern "C" {
             return 1;
         }
     }
+}
+
+
+// 1. 定义导出给 Python 的结构体
+// 必须与 Python 的 ctypes 结构完全对应
+struct RelicInfo {
+    int slotIndex;          // 0-5
+    uint32_t attributes[3]; // 正面属性 ID
+    uint32_t debuffs[3];    // 负面属性 ID (通常用于深渊遗物)
+};
+
+// 2. 关键配置 (根据 CT 表推算的默认值)
+// GameDataMan + 0xA8 通常是 EquipData (csgaitem 所在的容器)
+uintptr_t OFF_EQUIP_CONTAINER = 0xA8;
+
+// 对应 CT 表中的 [Gaitem] 基础索引值
+// 这个值决定了从数组的第几个位置开始算作“遗物槽位1”
+// 如果读出来是 0，我们可能需要调整这个值
+int RELIC_BASE_INDEX = 12;
+
+// 3. 内部辅助：获取第 N 个遗物的指针地址
+uintptr_t GetRelicPointer(int slot) {
+    if (hProcess == NULL || gameDataManAddr == 0) return 0;
+
+    // 第一步：读取装备容器指针 (csgaitem 的上一级)
+    uintptr_t containerPtr = 0;
+    if (!ReadProcessMemory(hProcess, (LPCVOID)(gameDataManAddr + OFF_EQUIP_CONTAINER), &containerPtr, sizeof(containerPtr), NULL)) {
+        return 0;
+    }
+    if (containerPtr == 0) return 0;
+
+    // 第二步：计算数组索引
+    // 逻辑复刻 CT 表: 8 + 8 * (Base + Slot * 4)
+    // 每个遗物间隔 4 个指针位置
+    int targetIndex = RELIC_BASE_INDEX + (slot * 4);
+
+    // 第三步：读取具体的遗物指针
+    // 指针数组起始偏移通常是 0x8 或 0x10，CT 表里写的是 8
+    uintptr_t itemPtrAddr = containerPtr + 0x8 + (targetIndex * 8);
+
+    uintptr_t finalRelicAddr = 0;
+    ReadProcessMemory(hProcess, (LPCVOID)itemPtrAddr, &finalRelicAddr, sizeof(finalRelicAddr), NULL);
+
+    return finalRelicAddr;
+}
+
+// 4. 导出函数：读取所有遗物数据
+extern "C" __declspec(dllexport) bool GetAllRelics(RelicInfo* outArray, int size) {
+    if (hProcess == NULL || size < 6) return false;
+
+    for (int i = 0; i < 6; i++) {
+        outArray[i].slotIndex = i;
+
+        uintptr_t addr = GetRelicPointer(i);
+
+        if (addr != 0) {
+            // 读取 3 个正面属性 (偏移 0x18, 0x1C, 0x20)
+            ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x18), &outArray[i].attributes[0], sizeof(uint32_t), NULL);
+            ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x1C), &outArray[i].attributes[1], sizeof(uint32_t), NULL);
+            ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x20), &outArray[i].attributes[2], sizeof(uint32_t), NULL);
+
+            // 读取 3 个负面属性 (偏移 0x40, 0x44, 0x48)
+            ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x40), &outArray[i].debuffs[0], sizeof(uint32_t), NULL);
+            ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x44), &outArray[i].debuffs[1], sizeof(uint32_t), NULL);
+            ReadProcessMemory(hProcess, (LPCVOID)(addr + 0x48), &outArray[i].debuffs[2], sizeof(uint32_t), NULL);
+        } else {
+            // 指针为空，清零
+            memset(outArray[i].attributes, 0, sizeof(outArray[i].attributes));
+            memset(outArray[i].debuffs, 0, sizeof(outArray[i].debuffs));
+        }
+    }
+    return true;
+}
+
+// 5. 导出函数：用于调试校准 Base Index
+// 如果读出来全是 0，我们可以用 Python 调这个函数来试错，不需要重新编译 C++
+extern "C" __declspec(dllexport) void DebugSetRelicIndex(int newIndex) {
+    RELIC_BASE_INDEX = newIndex;
 }

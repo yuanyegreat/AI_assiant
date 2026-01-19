@@ -467,7 +467,7 @@ extern "C" {
 // ==========================================\r
 // 新增逻辑：获取护符/遗物属性
 // ==========================================\r
-void InitCSGaitemAddress() {
+extern "C" __declspec(dllexport) void InitCSGaitemAddress() {
     if (csGaitemAddr != 0) return; // 避免重复扫描
 
     // Cheat Engine 脚本里的特征码
@@ -504,7 +504,7 @@ void InitCSGaitemAddress() {
 }
 
 // 获取第一个遗物的 Attribute 1 ID
-int GetFirstRelicAttribute1() {
+extern "C" __declspec(dllexport) int GetFirstRelicAttribute1() {
     // 确保已初始化
     if (csGaitemAddr == 0) InitCSGaitemAddress();
     if (gameDataManAddr == 0 || csGaitemAddr == 0) return -1;

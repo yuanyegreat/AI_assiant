@@ -15,10 +15,10 @@ uintptr_t gameDataManAddr = 0;
 uintptr_t worldChrManAddr = 0;
 uintptr_t funcAddresses[3] = { 0 };
 
-// ⚠️ 新增变量：用于存放 GameDataMan 到 csgaitem (装备容器) 的偏移量
+// 动态计算的偏移量
 uintptr_t OFF_EQUIP_CONTAINER = 0;
 
-// ⚠️ 新增变量：遗物起始索引，默认为 -1 (由自动探测计算)
+// 默认为 -1，必须通过校准找到
 int RELIC_BASE_INDEX = -1;
 
 struct HookInfo {
@@ -176,42 +176,38 @@ void* AllocNear(uintptr_t targetAddr, size_t size) {
 }
 
 // ==========================================
-// ⭐ 新增: 自动探测遗物索引 (AutoDetectRelicIndex)
+// ⭐ 核心新功能: 按数值反向扫描 (Calibration)
 // ==========================================
-// 策略：遍历前 500 个索引，找到“最大”的那个有效索引。
-// 这能避开前面的静态数据 (Index 84)，直接锁定玩家当前的动态数据 (Index 120)。
-void AutoDetectRelicIndex() {
-    if (hProcess == NULL || gameDataManAddr == 0 || OFF_EQUIP_CONTAINER == 0) return;
+// 这就是你要的功能：传入 7034600，我来告诉你 Index 是多少
+extern "C" __declspec(dllexport) bool ScanRelicByValue(uint32_t targetValue) {
+    if (hProcess == NULL || gameDataManAddr == 0 || OFF_EQUIP_CONTAINER == 0) return false;
 
     uintptr_t containerPtr = 0;
     ReadProcessMemory(hProcess, (LPCVOID)(gameDataManAddr + OFF_EQUIP_CONTAINER), &containerPtr, sizeof(containerPtr), NULL);
-    if (containerPtr == 0) return;
+    if (containerPtr == 0) return false;
 
-    int bestIndex = -1;
-
-    // 扩大扫描范围，确保能覆盖到 120 甚至更大的索引
-    for (int i = 0; i < 500; i++) {
+    // 遍历整个装备背包 (0 - 1000)
+    for (int i = 0; i < 1000; i++) {
+        // 计算第 i 个物品的地址
         uintptr_t itemPtrAddr = containerPtr + 0x8 + (i * 8);
         uintptr_t relicAddr = 0;
 
         if (ReadProcessMemory(hProcess, (LPCVOID)itemPtrAddr, &relicAddr, sizeof(relicAddr), NULL) && relicAddr != 0) {
             uint32_t attr1 = 0;
+            // 读取 Attribute 1
             if (ReadProcessMemory(hProcess, (LPCVOID)(relicAddr + 0x18), &attr1, sizeof(attr1), NULL)) {
-                // 校验 ID 是否在 600w - 800w 之间
-                if (attr1 > 6000000 && attr1 < 8000000) {
-                    // ⚠️ 发现有效数据！不要停，记录下来继续往后找，我们要找最大的那个
-                    bestIndex = i;
+
+                // ⭐ 如果找到了用户输入的数值，立刻锁定这个位置！
+                if (attr1 == targetValue) {
+                    RELIC_BASE_INDEX = i;
+                    // printf("Calibrated! Found value %d at Index %d\n", targetValue, i);
+                    return true;
                 }
             }
         }
     }
-
-    // 只有找到了才更新全局变量
-    if (bestIndex != -1) {
-        RELIC_BASE_INDEX = bestIndex;
-    }
+    return false; // 没找到
 }
-
 
 // ==========================================
 // 🚀 导出接口
@@ -230,7 +226,7 @@ extern "C" {
         std::vector<BYTE> buffer(moduleSize);
         if (!ReadProcessMemory(hProcess, (LPCVOID)moduleBase, buffer.data(), moduleSize, 0)) return 0;
 
-        // 1. 扫描 GameDataMan
+        // 1. GameDataMan
         uintptr_t addrGDM = ScanPattern(buffer, "\x48\x8B\x0D\x00\x00\x00\x00\xF3\x48\x0F\x2C\xC0", "xxx????xxxxx");
         if (addrGDM) {
             int32_t offset = 0;
@@ -238,7 +234,7 @@ extern "C" {
             gameDataManAddr = addrGDM + 7 + offset;
         }
 
-        // 2. 扫描 WorldChrMan
+        // 2. WorldChrMan
         uintptr_t addrWCM = ScanPattern(buffer, "\x48\x8B\x05\x00\x00\x00\x00\x0F\x28\xF1\x48\x85\xC0", "xxx????xxxxxx");
         if (addrWCM) {
             int32_t offset = 0;
@@ -246,8 +242,7 @@ extern "C" {
             worldChrManAddr = addrWCM + 7 + offset;
         }
 
-        // ⭐ 3. 新增: 扫描 CSGaitem 并计算偏移量 (OFF_EQUIP_CONTAINER)
-        // 特征码来自 CT 表: 48 8D 44 24 40 ... 48 8B 0D ...
+        // 3. CSGaitem -> OFF_EQUIP_CONTAINER
         const char* patternGaItem = "\x48\x8D\x44\x24\x40\x48\x89\x44\x24\x50\x8B\x02\x89\x44\x24\x40\x48\x8B\x0D\x00\x00\x00\x00\x48\x85\xC9";
         const char* maskGaItem    = "xxxxxxxxxxxxxxxxxxx????xxx";
         uintptr_t foundGaItem = ScanPattern(buffer, patternGaItem, maskGaItem);
@@ -261,11 +256,7 @@ extern "C" {
 
         ScanFuncs(buffer);
 
-        // ⭐ 4. 自动计算 RELIC_BASE_INDEX (寻找最大有效索引)
-        if (gameDataManAddr && OFF_EQUIP_CONTAINER != 0) {
-            AutoDetectRelicIndex();
-        }
-
+        // 注意：这里不再自动调用 AutoDetect，等待用户手动校准
         return (gameDataManAddr && worldChrManAddr && OFF_EQUIP_CONTAINER != 0) ? 1 : 0;
     }
 
@@ -460,7 +451,7 @@ extern "C" {
     }
 
     // ==========================================
-    // ⭐ 新增: 遗物 (Relic) 相关导出
+    // ⭐ 遗物 (Relic) 相关导出
     // ==========================================
 
     struct RelicInfo {
@@ -480,7 +471,7 @@ extern "C" {
         if (!ReadProcessMemory(hProcess, (LPCVOID)(gameDataManAddr + OFF_EQUIP_CONTAINER), &containerPtr, sizeof(containerPtr), NULL)) return 0;
         if (containerPtr == 0) return 0;
 
-        // 使用自动探测到的最佳索引
+        // 使用校准后的索引
         int targetIndex = RELIC_BASE_INDEX + (slot * 4);
 
         uintptr_t itemPtrAddr = containerPtr + 0x8 + (targetIndex * 8);

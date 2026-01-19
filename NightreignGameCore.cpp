@@ -3,6 +3,8 @@
 #include <vector>
 #include <string>
 #include <iostream>
+#include <sstream>
+#include <iomanip>
 
 // ==========================================
 // 全局变量
@@ -40,6 +42,56 @@ const uintptr_t OFF_SKILL_MAX = 0x2C;
 const uintptr_t OFF_GOD_FLAG = 0xF8;
 const uintptr_t OFF_NO_DEAD = 0x189;
 const uintptr_t OFF_NO_GOODS = 0x551;
+
+// ==========================================\r
+// 工具函数：特征码扫描 (AOB Scan)
+// ==========================================\r
+uintptr_t AOBScanModuleUnique(const std::string& moduleName, const std::string& pattern) {
+    // 将 pattern 字符串转换为字节数组和掩码
+    // 例如 "48 8B ??" -> bytes: {0x48, 0x8B, 0}, mask: {true, true, false}
+    std::vector<int> patternBytes;
+    std::stringstream ss(pattern);
+    std::string byteStr;
+
+    while (ss >> byteStr) {
+        if (byteStr == "??" || byteStr == "?") {
+            patternBytes.push_back(-1); // -1 代表通配符
+        } else {
+            patternBytes.push_back(std::stoi(byteStr, nullptr, 16));
+        }
+    }
+
+    if (moduleBase == 0 || moduleSize == 0) {
+        // 如果全局变量未初始化，尝试获取（这里假设你已经有初始化逻辑，或者你可以再次调用 GetModuleHandle）
+        moduleBase = (uintptr_t)GetModuleHandle(NULL);
+        // 这里简化处理，如果没有获取 moduleSize，暂时不扫描防止崩溃，或者你需要补全获取 size 的逻辑
+        if (moduleBase == 0) return 0;
+        // 简单的获取大小逻辑，如果你的代码里已经有更好的，请使用你的
+        IMAGE_DOS_HEADER* dosHeader = (IMAGE_DOS_HEADER*)moduleBase;
+        IMAGE_NT_HEADERS* ntHeaders = (IMAGE_NT_HEADERS*)(moduleBase + dosHeader->e_lfanew);
+        moduleSize = ntHeaders->OptionalHeader.SizeOfImage;
+    }
+
+    BYTE* pScanStart = (BYTE*)moduleBase;
+    size_t patternLen = patternBytes.size();
+
+    // 遍历内存进行匹配
+    for (size_t i = 0; i < moduleSize - patternLen; ++i) {
+        bool found = true;
+        for (size_t j = 0; j < patternLen; ++j) {
+            if (patternBytes[j] != -1 && pScanStart[i + j] != (BYTE)patternBytes[j]) {
+                found = false;
+                break;
+            }
+        }
+        if (found) {
+            return (uintptr_t)(pScanStart + i);
+        }
+    }
+
+    return 0; // 未找到
+}
+
 
 // ==========================================
 // 内部工具函数
@@ -411,67 +463,86 @@ extern "C" {
     }
 }
 
-void InitCSGaitemAddress() {
-    // 特征码：48 8D 44 24 40 48 89 44 24 50 8B 02 89 44 24 40 48 8B 0D
-    // 注意：Hexinton 脚本里这里有一个 offset = 0x10 的处理，说明真正的 mov rcx, [rip+offset] 在特征码开始后的第16个字节
-    // 原始特征码较长，我们取关键部分进行搜索，或者直接使用脚本里的完整码
-    // 对应 Lua: {name = "CSGaitem", aob = "48 8D ... 48 8B 0D ?? ?? ?? ?? 48 85 C9", offset = 0x10}
 
-    // 假设你有一个 AOBScan 函数，这里是伪代码逻辑，请替换为你实际的扫描函数
-    // 这里的 pattern 对应 offset 0x10 处的那条指令: 48 8B 0D ...
-    std::string pattern = "48 8B 0D ?? ?? ?? ?? 48 85 C9";
+// ==========================================\r
+// 新增逻辑：获取护符/遗物属性
+// ==========================================\r
+void InitCSGaitemAddress() {
+    if (csGaitemAddr != 0) return; // 避免重复扫描
+
+    // Cheat Engine 脚本里的特征码
+    // 注意：Lua脚本里 offset=0x10 指向的是 "48 8B 0D..." 这条指令
+    // 我们直接扫描这条指令及其上下文
+    // 原始特征码片段: 48 8D 44 24 40 ... (省略) ... 48 8B 0D
+
+    // 为了稳健，我们使用脚本中定义的 CSGaitem 关键特征码
+    // 对应 Lua: {name = "CSGaitem", aob = "48 8D 44 24 40 48 89 44 24 50 8B 02 89 44 24 40 48 8B 0D"}
+    // 这里的最后部分 48 8B 0D 就是我们要解引用的地方
+
+    std::string pattern = "48 8D 44 24 40 48 89 44 24 50 8B 02 89 44 24 40 48 8B 0D";
     uintptr_t aobResult = AOBScanModuleUnique("nightreign.exe", pattern);
 
     if (aobResult != 0) {
-        // 解析 RIP 寻址 ( 48 8B 0D [Offset] )
-        // 指令长度 7 字节
+        // Lua脚本中 offset = 0x10 (16 dec)。
+        // 意思是从找到的地址开始，往后数 16 个字节，才是我们要解析的指令 (48 8B 0D ...)
+        uintptr_t instructionAddr = aobResult + 0x10;
+
+        // 解析 RIP 寻址: 48 8B 0D [Offset]
+        // [Offset] 是 4字节整数 (int32_t)
         int32_t ripOffset = 0;
-        ReadProcessMemory(hProcess, (LPCVOID)(aobResult + 3), &ripOffset, sizeof(ripOffset), 0);
-        csGaitemAddr = aobResult + 7 + ripOffset;
-        std::cout << "CSGaitem Address: " << std::hex << csGaitemAddr << std::endl;
+        // 读取指令后的 4 个字节
+        // 指令结构: OpCode(3 bytes: 48 8B 0D) + Offset(4 bytes)
+        ReadProcessMemory(hProcess, (LPCVOID)(instructionAddr + 3), &ripOffset, sizeof(ripOffset), 0);
+
+        // 目标地址 = 当前指令地址 + 指令长度(7) + 偏移量
+        csGaitemAddr = instructionAddr + 7 + ripOffset;
+
+        std::cout << "[+] CSGaitem Address found: " << std::hex << csGaitemAddr << std::dec << std::endl;
     } else {
-        std::cerr << "Failed to find CSGaitem" << std::endl;
+        std::cout << "[-] Failed to find CSGaitem pattern." << std::endl;
     }
 }
 
-// 3. 获取第一个遗物 (1st Equipped Relic) 的 Attribute 1 ID 的方法
+// 获取第一个遗物的 Attribute 1 ID
 int GetFirstRelicAttribute1() {
+    // 确保已初始化
+    if (csGaitemAddr == 0) InitCSGaitemAddress();
     if (gameDataManAddr == 0 || csGaitemAddr == 0) return -1;
 
-    // 步骤 1: 获取 PlayerGameData 指针
-    uintptr_t playerGameData = 0;
-    // [GameDataMan] + 0x8
+    // 1. 获取 PlayerGameData
     uintptr_t ptrToPlayerGameData = 0;
+    // 读取 GameDataMan 指向的地址
     ReadProcessMemory(hProcess, (LPCVOID)gameDataManAddr, &ptrToPlayerGameData, sizeof(ptrToPlayerGameData), 0);
-    ReadProcessMemory(hProcess, (LPCVOID)(ptrToPlayerGameData + 0x8), &playerGameData, sizeof(playerGameData), 0);
+    if (ptrToPlayerGameData == 0) return -1;
 
+    // 读取 [GameDataMan] + 0x8
+    uintptr_t playerGameData = 0;
+    ReadProcessMemory(hProcess, (LPCVOID)(ptrToPlayerGameData + 0x8), &playerGameData, sizeof(playerGameData), 0);
     if (playerGameData == 0) return -1;
 
-    // 步骤 2: 获取第一个遗物的索引 (Index)
-    // 偏移 0x2F4 对应 "1st Equipped Relic" 的索引
-    int16_t relicIndex = 0;
-    ReadProcessMemory(hProcess, (LPCVOID)(playerGameData + 0x2F4), &relicIndex, sizeof(relicIndex), 0);
+    // 2. 获取第一个遗物的 Index (0x2F4)
+    int16_t relicIndex = 0; // SmallInteger 是 2 字节
+    if (!ReadProcessMemory(hProcess, (LPCVOID)(playerGameData + 0x2F4), &relicIndex, sizeof(relicIndex), 0)) {
+        return -1;
+    }
 
-    // 步骤 3: 从 CSGaitem 获取具体的遗物对象指针
-    // Lua 逻辑: 8 + 8 * [GaitemIndex]
-    // CSGaitem 本身存放了一个指针，或者直接作为基址使用，根据 Lua "readQword(CSGaitem)" 来判断
-    // 通常 registerSymbol 后，直接读取符号地址的值。
-    uintptr_t csGaitemBase = 0;
-    ReadProcessMemory(hProcess, (LPCVOID)csGaitemAddr, &csGaitemBase, sizeof(csGaitemBase), 0);
+    // 3. 进入 CSGaitem 查找物品指针
+    // CSGaitem 本身是一个指向管理器的指针
+    uintptr_t gaitemManager = 0;
+    ReadProcessMemory(hProcess, (LPCVOID)csGaitemAddr, &gaitemManager, sizeof(gaitemManager), 0);
+    if (gaitemManager == 0) return -1;
 
-    if (csGaitemBase == 0) return -1;
+    // 数组逻辑: Manager + 0x8 + (Index * 8)
+    uintptr_t itemPtrLocation = gaitemManager + 0x8 + (relicIndex * 8);
+    uintptr_t itemAddr = 0;
+    ReadProcessMemory(hProcess, (LPCVOID)itemPtrLocation, &itemAddr, sizeof(itemAddr), 0);
+    if (itemAddr == 0) return -1;
 
-    // 计算目标指针在数组中的位置
-    uintptr_t targetRelicPtrLoc = csGaitemBase + 0x8 + (relicIndex * 0x8);
-    uintptr_t targetRelicAddr = 0;
-    ReadProcessMemory(hProcess, (LPCVOID)targetRelicPtrLoc, &targetRelicAddr, sizeof(targetRelicAddr), 0);
+    // 4. 读取 Attribute 1 (偏移 0x18)
+    int32_t attribute1 = 0;
+    if (ReadProcessMemory(hProcess, (LPCVOID)(itemAddr + 0x18), &attribute1, sizeof(attribute1), 0)) {
+        return attribute1;
+    }
 
-    if (targetRelicAddr == 0) return -1;
-
-    // 步骤 4: 读取 Attribute 1 ID
-    // 偏移 +0x18
-    int32_t attribute1ID = 0;
-    ReadProcessMemory(hProcess, (LPCVOID)(targetRelicAddr + 0x18), &attribute1ID, sizeof(attribute1ID), 0);
-
-    return attribute1ID;
+    return -1;
 }

@@ -27,7 +27,7 @@ struct HookInfo {
 } ohkHook = {0};
 
 struct RelicRawData {
-    int fields[6]; // 对应 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C
+    int fields[16];
 };
 
 const uintptr_t OFFSET_PLAYER = 0x174E8;
@@ -532,13 +532,14 @@ extern "C" __declspec(dllexport) void InitCSGaitemAddress() {
     }
 }
 
-// 导出函数：获取所有 6 个遗物的数据
-// outBuffer 必须是一个大小至少为 6 * sizeof(RelicRawData) 的数组
+
+
 extern "C" __declspec(dllexport) int GetAllRelics(RelicRawData* outBuffer) {
+    // 确保已初始化
     if (csGaitemAddr == 0) InitCSGaitemAddress();
     if (gameDataManAddr == 0 || csGaitemAddr == 0) return 0;
 
-    // 1. 获取 PlayerGameData
+    // 1. 获取 PlayerGameData 指针
     uintptr_t ptrToPlayerGameData = 0;
     ReadProcessMemory(hProcess, (LPCVOID)gameDataManAddr, &ptrToPlayerGameData, sizeof(ptrToPlayerGameData), 0);
     if (ptrToPlayerGameData == 0) return 0;
@@ -553,23 +554,21 @@ extern "C" __declspec(dllexport) int GetAllRelics(RelicRawData* outBuffer) {
     if (gaitemManager == 0) return 0;
 
     // 3. 循环读取 6 个遗物
-    // Standard: Index 0-2 (Offsets 2F4, 2F8, 2FC)
-    // Deep:     Index 3-5 (Offsets 300, 304, 308)
-    // 规律：起始 0x2F4，步长 4
     for (int i = 0; i < 6; i++) {
+        // 计算索引地址：0x2F4 + (i * 4)
         uintptr_t indexAddr = playerGameData + 0x2F4 + (i * 4);
         int16_t relicIndex = -1;
 
         // 读取索引 (2字节)
         if (!ReadProcessMemory(hProcess, (LPCVOID)indexAddr, &relicIndex, sizeof(relicIndex), 0)) {
-            // 读取失败，填充 -1
-            for(int k=0; k<6; k++) outBuffer[i].fields[k] = -1;
+            // 读取失败，全部填 -1
+            for(int k=0; k<16; k++) outBuffer[i].fields[k] = -1;
             continue;
         }
 
-        // 如果索引无效 (通常 -1 是空，但这里我们根据实际读取判断，假设 < 0 为空)
+        // 索引无效判断
         if (relicIndex < 0) {
-            for(int k=0; k<6; k++) outBuffer[i].fields[k] = -1;
+            for(int k=0; k<16; k++) outBuffer[i].fields[k] = -1;
             continue;
         }
 
@@ -579,14 +578,13 @@ extern "C" __declspec(dllexport) int GetAllRelics(RelicRawData* outBuffer) {
         ReadProcessMemory(hProcess, (LPCVOID)itemPtrLocation, &itemAddr, sizeof(itemAddr), 0);
 
         if (itemAddr == 0) {
-            for(int k=0; k<6; k++) outBuffer[i].fields[k] = -1;
+            for(int k=0; k<16; k++) outBuffer[i].fields[k] = -1;
             continue;
         }
 
-        // 读取 0x18 开始的 6 个整数 (24字节)
-        // 假设布局: [Att1][Att2][Att3][Debuff1][Debuff2][Debuff3] 或其他顺序，统一读出来
-        if (!ReadProcessMemory(hProcess, (LPCVOID)(itemAddr + 0x18), outBuffer[i].fields, sizeof(int) * 6, 0)) {
-             for(int k=0; k<6; k++) outBuffer[i].fields[k] = -1;
+        // 关键修改：一次性读取 16 个整数 (64 字节)，从偏移 0x18 开始
+        if (!ReadProcessMemory(hProcess, (LPCVOID)(itemAddr + 0x18), outBuffer[i].fields, sizeof(int) * 16, 0)) {
+             for(int k=0; k<16; k++) outBuffer[i].fields[k] = -1;
         }
     }
 

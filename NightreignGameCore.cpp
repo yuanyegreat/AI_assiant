@@ -43,49 +43,74 @@ const uintptr_t OFF_GOD_FLAG = 0xF8;
 const uintptr_t OFF_NO_DEAD = 0x189;
 const uintptr_t OFF_NO_GOODS = 0x551;
 
-// ==========================================\r
-// 工具函数：特征码扫描 (AOB Scan)
-// ==========================================\r
+// ==========================================
+// 工具函数：特征码扫描 (AOB Scan) - 外部进程版
+// ==========================================
 uintptr_t AOBScanModuleUnique(const std::string& moduleName, const std::string& pattern) {
-    // 将 pattern 字符串转换为字节数组和掩码
-    // 例如 "48 8B ??" -> bytes: {0x48, 0x8B, 0}, mask: {true, true, false}
+    // 1. 解析特征码
     std::vector<int> patternBytes;
     std::stringstream ss(pattern);
     std::string byteStr;
 
     while (ss >> byteStr) {
         if (byteStr == "??" || byteStr == "?") {
-            patternBytes.push_back(-1); // -1 代表通配符
+            patternBytes.push_back(-1); // 通配符
         } else {
             patternBytes.push_back(std::stoi(byteStr, nullptr, 16));
         }
     }
 
-    if (moduleBase == 0 || moduleSize == 0) {
-        // 如果全局变量未初始化，尝试获取（这里假设你已经有初始化逻辑，或者你可以再次调用 GetModuleHandle）
-        moduleBase = (uintptr_t)GetModuleHandle(NULL);
-        // 这里简化处理，如果没有获取 moduleSize，暂时不扫描防止崩溃，或者你需要补全获取 size 的逻辑
-        if (moduleBase == 0) return 0;
-        // 简单的获取大小逻辑，如果你的代码里已经有更好的，请使用你的
-        IMAGE_DOS_HEADER* dosHeader = (IMAGE_DOS_HEADER*)moduleBase;
-        IMAGE_NT_HEADERS* ntHeaders = (IMAGE_NT_HEADERS*)(moduleBase + dosHeader->e_lfanew);
-        moduleSize = ntHeaders->OptionalHeader.SizeOfImage;
-    }
+    if (moduleBase == 0 || hProcess == NULL) return 0;
 
-    BYTE* pScanStart = (BYTE*)moduleBase;
-    size_t patternLen = patternBytes.size();
-
-    // 遍历内存进行匹配
-    for (size_t i = 0; i < moduleSize - patternLen; ++i) {
-        bool found = true;
-        for (size_t j = 0; j < patternLen; ++j) {
-            if (patternBytes[j] != -1 && pScanStart[i + j] != (BYTE)patternBytes[j]) {
-                found = false;
-                break;
+    // 确保 moduleSize 已设置，如果没有则尝试获取（简单的 DOS/NT 头解析）
+    if (moduleSize == 0) {
+        BYTE headerBuffer[0x400];
+        if (ReadProcessMemory(hProcess, (LPCVOID)moduleBase, headerBuffer, sizeof(headerBuffer), 0)) {
+            IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)headerBuffer;
+            if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+                // 读取 NT 头需要根据 e_lfanew 偏移
+                long ntOffset = dos->e_lfanew;
+                BYTE ntBuffer[0x400];
+                if (ReadProcessMemory(hProcess, (LPCVOID)(moduleBase + ntOffset), ntBuffer, sizeof(ntBuffer), 0)) {
+                    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)ntBuffer;
+                    moduleSize = nt->OptionalHeader.SizeOfImage;
+                }
             }
         }
-        if (found) {
-            return (uintptr_t)(pScanStart + i);
+    }
+    if (moduleSize == 0) moduleSize = 0x4000000; // 兜底：如果获取失败，默认扫 64MB
+
+    // 2. 分块扫描逻辑
+    const size_t CHUNK_SIZE = 1024 * 64; // 每次读取 64KB
+    std::vector<BYTE> buffer(CHUNK_SIZE);
+    size_t patternLen = patternBytes.size();
+
+    for (size_t i = 0; i < moduleSize; i += (CHUNK_SIZE - patternLen)) {
+        SIZE_T bytesRead = 0;
+
+        // 从游戏进程读取内存到本地 buffer
+        if (!ReadProcessMemory(hProcess, (LPCVOID)(moduleBase + i), buffer.data(), CHUNK_SIZE, &bytesRead) || bytesRead == 0) {
+            continue;
+        }
+
+        // 在本地 buffer 中进行匹配
+        // 注意：搜索范围是 bytesRead
+        for (size_t j = 0; j < bytesRead; ++j) {
+            // 防止越界
+            if (j + patternLen > bytesRead) break;
+
+            bool found = true;
+            for (size_t k = 0; k < patternLen; ++k) {
+                if (patternBytes[k] != -1 && buffer[j + k] != (BYTE)patternBytes[k]) {
+                    found = false;
+                    break;
+                }
+            }
+
+            if (found) {
+                // 找到后，返回：模块基址 + 当前块偏移(i) + 块内偏移(j)
+                return moduleBase + i + j;
+            }
         }
     }
 

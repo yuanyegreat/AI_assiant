@@ -26,6 +26,10 @@ struct HookInfo {
     bool active;
 } ohkHook = {0};
 
+struct RelicRawData {
+    int fields[6]; // 对应 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C
+};
+
 const uintptr_t OFFSET_PLAYER = 0x174E8;
 const uintptr_t OFF_HP_CUR = 0x140;
 const uintptr_t OFF_HP_MAX = 0x144;
@@ -528,46 +532,63 @@ extern "C" __declspec(dllexport) void InitCSGaitemAddress() {
     }
 }
 
-// 获取第一个遗物的 Attribute 1 ID
-extern "C" __declspec(dllexport) int GetFirstRelicAttribute1() {
-    // 确保已初始化
+// 导出函数：获取所有 6 个遗物的数据
+// outBuffer 必须是一个大小至少为 6 * sizeof(RelicRawData) 的数组
+extern "C" __declspec(dllexport) int GetAllRelics(RelicRawData* outBuffer) {
     if (csGaitemAddr == 0) InitCSGaitemAddress();
-    if (gameDataManAddr == 0 || csGaitemAddr == 0) return -1;
+    if (gameDataManAddr == 0 || csGaitemAddr == 0) return 0;
 
     // 1. 获取 PlayerGameData
     uintptr_t ptrToPlayerGameData = 0;
-    // 读取 GameDataMan 指向的地址
     ReadProcessMemory(hProcess, (LPCVOID)gameDataManAddr, &ptrToPlayerGameData, sizeof(ptrToPlayerGameData), 0);
-    if (ptrToPlayerGameData == 0) return -1;
+    if (ptrToPlayerGameData == 0) return 0;
 
-    // 读取 [GameDataMan] + 0x8
     uintptr_t playerGameData = 0;
     ReadProcessMemory(hProcess, (LPCVOID)(ptrToPlayerGameData + 0x8), &playerGameData, sizeof(playerGameData), 0);
-    if (playerGameData == 0) return -1;
+    if (playerGameData == 0) return 0;
 
-    // 2. 获取第一个遗物的 Index (0x2F4)
-    int16_t relicIndex = 0; // SmallInteger 是 2 字节
-    if (!ReadProcessMemory(hProcess, (LPCVOID)(playerGameData + 0x2F4), &relicIndex, sizeof(relicIndex), 0)) {
-        return -1;
-    }
-
-    // 3. 进入 CSGaitem 查找物品指针
-    // CSGaitem 本身是一个指向管理器的指针
+    // 2. 获取 CSGaitem Manager 基址
     uintptr_t gaitemManager = 0;
     ReadProcessMemory(hProcess, (LPCVOID)csGaitemAddr, &gaitemManager, sizeof(gaitemManager), 0);
-    if (gaitemManager == 0) return -1;
+    if (gaitemManager == 0) return 0;
 
-    // 数组逻辑: Manager + 0x8 + (Index * 8)
-    uintptr_t itemPtrLocation = gaitemManager + 0x8 + (relicIndex * 8);
-    uintptr_t itemAddr = 0;
-    ReadProcessMemory(hProcess, (LPCVOID)itemPtrLocation, &itemAddr, sizeof(itemAddr), 0);
-    if (itemAddr == 0) return -1;
+    // 3. 循环读取 6 个遗物
+    // Standard: Index 0-2 (Offsets 2F4, 2F8, 2FC)
+    // Deep:     Index 3-5 (Offsets 300, 304, 308)
+    // 规律：起始 0x2F4，步长 4
+    for (int i = 0; i < 6; i++) {
+        uintptr_t indexAddr = playerGameData + 0x2F4 + (i * 4);
+        int16_t relicIndex = -1;
 
-    // 4. 读取 Attribute 1 (偏移 0x18)
-    int32_t attribute1 = 0;
-    if (ReadProcessMemory(hProcess, (LPCVOID)(itemAddr + 0x18), &attribute1, sizeof(attribute1), 0)) {
-        return attribute1;
+        // 读取索引 (2字节)
+        if (!ReadProcessMemory(hProcess, (LPCVOID)indexAddr, &relicIndex, sizeof(relicIndex), 0)) {
+            // 读取失败，填充 -1
+            for(int k=0; k<6; k++) outBuffer[i].fields[k] = -1;
+            continue;
+        }
+
+        // 如果索引无效 (通常 -1 是空，但这里我们根据实际读取判断，假设 < 0 为空)
+        if (relicIndex < 0) {
+            for(int k=0; k<6; k++) outBuffer[i].fields[k] = -1;
+            continue;
+        }
+
+        // 计算物品地址: Manager + 8 + (Index * 8)
+        uintptr_t itemPtrLocation = gaitemManager + 0x8 + (relicIndex * 8);
+        uintptr_t itemAddr = 0;
+        ReadProcessMemory(hProcess, (LPCVOID)itemPtrLocation, &itemAddr, sizeof(itemAddr), 0);
+
+        if (itemAddr == 0) {
+            for(int k=0; k<6; k++) outBuffer[i].fields[k] = -1;
+            continue;
+        }
+
+        // 读取 0x18 开始的 6 个整数 (24字节)
+        // 假设布局: [Att1][Att2][Att3][Debuff1][Debuff2][Debuff3] 或其他顺序，统一读出来
+        if (!ReadProcessMemory(hProcess, (LPCVOID)(itemAddr + 0x18), outBuffer[i].fields, sizeof(int) * 6, 0)) {
+             for(int k=0; k<6; k++) outBuffer[i].fields[k] = -1;
+        }
     }
 
-    return -1;
+    return 1; // 成功
 }
